@@ -27,20 +27,25 @@
 
 -module(mod_offline).
 -author('alexey@process-one.net').
-
+-xep([{xep, 160}, {version, "1.0"}]).
+-xep([{xep, 23}, {version, "1.3"}]).
+-xep([{xep, 22}, {version, "1.4"}]).
+-xep([{xep, 85}, {version, "2.1"}]).
 -behaviour(gen_mod).
 
 %% gen_mod handlers
 -export([start/2, stop/1]).
 
 %% Hook handlers
--export([inspect_packet/3,
-         resend_offline_messages/2,
+-export([inspect_packet/4,
          pop_offline_messages/3,
          get_sm_features/5,
          remove_expired_messages/1,
          remove_old_messages/2,
-         remove_user/2]).
+         remove_user/2,
+         remove_user/3,
+         determine_amp_strategy/5,
+         amp_failed_event/2]).
 
 %% Internal exports
 -export([start_link/3]).
@@ -49,15 +54,28 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
+%% helpers to be used from backend moudules
+-export([is_expired_message/2]).
+
 -include("ejabberd.hrl").
 -include("jlib.hrl").
+-include("amp.hrl").
 -include("mod_offline.hrl").
 
 -define(PROCNAME, ejabberd_offline).
 
 %% default value for the maximum number of user messages
 -define(MAX_USER_MESSAGES, infinity).
--define(BACKEND, (mod_offline_backend:backend())).
+-define(BACKEND, mod_offline_backend).
+
+-type msg() :: #offline_msg{us :: {ejabberd:luser(), ejabberd:lserver()},
+                          timestamp :: erlang:timestamp(),
+                          expire :: erlang:timestamp() | never,
+                          from :: jid(),
+                          to :: jid(),
+                          packet :: exml:element()}.
+
+-export_type([msg/0]).
 
 -record(state, {host, access_max_user_messages}).
 
@@ -67,8 +85,31 @@
 -callback init(Host, Opts) -> ok when
     Host :: binary(),
     Opts :: list().
-
--callback remove_user(LUser, LServer) -> ok when
+-callback pop_messages(LUser, LServer) -> {ok, Result} | {error, Reason} when
+    LUser :: ejabberd:luser(),
+    LServer :: ejabberd:lserver(),
+    Reason :: term(),
+    Result :: list(#offline_msg{}).
+-callback write_messages(LUser, LServer, Msgs) ->
+    ok | {error, Reason}  when
+    LUser :: ejabberd:luser(),
+    LServer :: ejabberd:lserver(),
+    Msgs :: list(),
+    Reason :: term().
+-callback count_offline_messages(LUser, LServer, MaxToArchive) -> integer() when
+      LUser :: ejabberd:luser(),
+      LServer :: ejabberd:lserver(),
+      MaxToArchive :: integer().
+-callback remove_expired_messages(Host) -> {error, Reason} | {ok, Count} when
+    Host :: ejabberd:lserver(),
+    Reason :: term(),
+    Count :: integer().
+-callback remove_old_messages(Host, Timestamp) -> {error, Reason} | {ok, Count} when
+    Host :: ejabberd:lserver(),
+    Timestamp :: erlang:timestamp(),
+    Reason :: term(),
+    Count :: integer().
+-callback remove_user(LUser, LServer) -> any() when
     LUser :: binary(),
     LServer :: binary().
 
@@ -78,34 +119,42 @@
 start(Host, Opts) ->
     AccessMaxOfflineMsgs = gen_mod:get_opt(access_max_user_messages, Opts,
                                            max_user_offline_messages),
-    gen_mod:start_backend_module(?MODULE, Opts),
+    gen_mod:start_backend_module(?MODULE, Opts, [pop_messages, write_messages]),
     ?BACKEND:init(Host, Opts),
     start_worker(Host, AccessMaxOfflineMsgs),
     ejabberd_hooks:add(offline_message_hook, Host,
-		       ?MODULE, inspect_packet, 50),
+                       ?MODULE, inspect_packet, 50),
     ejabberd_hooks:add(resend_offline_messages_hook, Host,
-		       ?MODULE, pop_offline_messages, 50),
+                       ?MODULE, pop_offline_messages, 50),
     ejabberd_hooks:add(remove_user, Host,
-		       ?MODULE, remove_user, 50),
+                       ?MODULE, remove_user, 50),
     ejabberd_hooks:add(anonymous_purge_hook, Host,
-		       ?MODULE, remove_user, 50),
+                       ?MODULE, remove_user, 50),
     ejabberd_hooks:add(disco_sm_features, Host,
-		       ?MODULE, get_sm_features, 50),
+                       ?MODULE, get_sm_features, 50),
     ejabberd_hooks:add(disco_local_features, Host,
-		       ?MODULE, get_sm_features, 50),
+                       ?MODULE, get_sm_features, 50),
+    ejabberd_hooks:add(amp_determine_strategy, Host,
+                       ?MODULE, determine_amp_strategy, 30),
+    ejabberd_hooks:add(failed_to_store_message, Host,
+                       ?MODULE, amp_failed_event, 30),
     ok.
 
 stop(Host) ->
     ejabberd_hooks:delete(offline_message_hook, Host,
-			  ?MODULE, inspect_packet, 50),
+                          ?MODULE, inspect_packet, 50),
     ejabberd_hooks:delete(resend_offline_messages_hook, Host,
-			  ?MODULE, pop_offline_messages, 50),
+                          ?MODULE, pop_offline_messages, 50),
     ejabberd_hooks:delete(remove_user, Host,
-			  ?MODULE, remove_user, 50),
+                          ?MODULE, remove_user, 50),
     ejabberd_hooks:delete(anonymous_purge_hook, Host,
-			  ?MODULE, remove_user, 50),
+                          ?MODULE, remove_user, 50),
     ejabberd_hooks:delete(disco_sm_features, Host, ?MODULE, get_sm_features, 50),
     ejabberd_hooks:delete(disco_local_features, Host, ?MODULE, get_sm_features, 50),
+    ejabberd_hooks:delete(amp_determine_strategy, Host,
+                          ?MODULE, determine_amp_strategy, 30),
+    ejabberd_hooks:delete(failed_to_store_message, Host,
+                          ?MODULE, amp_failed_event, 30),
     stop_worker(Host),
     ok.
 
@@ -113,36 +162,61 @@ stop(Host) ->
 %% Server side functions
 %% ------------------------------------------------------------------
 
+amp_failed_event(Packet, From) ->
+    mod_amp:check_packet(Packet, From, offline_failed).
+
 handle_offline_msg(#offline_msg{us=US} = Msg, AccessMaxOfflineMsgs) ->
     {LUser, LServer} = US,
     Msgs = receive_all(US, [Msg]),
-    MaxOfflineMsgs = get_max_user_messages(
-        AccessMaxOfflineMsgs, LUser, LServer),
-    case ?BACKEND:write_messages(LUser, LServer, Msgs, MaxOfflineMsgs) of
+    MaxOfflineMsgs = get_max_user_messages(AccessMaxOfflineMsgs, LUser, LServer),
+    Len = length(Msgs),
+    case is_message_count_threshold_reached(MaxOfflineMsgs, LUser, LServer, Len) of
+        false ->
+            write_messages(LUser, LServer, Msgs);
+        true ->
+            discard_warn_sender(Msgs)
+    end.
+
+write_messages(LUser, LServer, Msgs) ->
+    case ?BACKEND:write_messages(LUser, LServer, Msgs) of
         ok ->
+            [mod_amp:check_packet(Packet, From, archived)
+             || #offline_msg{from = From, packet = Packet} <- Msgs],
             ok;
-        {discarded, DiscardedMsgs} ->
-            discard_warn_sender(DiscardedMsgs);
         {error, Reason} ->
             ?ERROR_MSG("~ts@~ts: write_messages failed with ~p.",
                 [LUser, LServer, Reason]),
             discard_warn_sender(Msgs)
     end.
 
-%% Function copied from ejabberd_sm.erl:
+-spec is_message_count_threshold_reached(integer(), ejabberd:luser(),
+                                         ejabberd:lserver(), integer()) ->
+    boolean().
+is_message_count_threshold_reached(infinity, _LUser, _LServer, _Len) ->
+    false;
+is_message_count_threshold_reached(MaxOfflineMsgs, _LUser, _LServer, Len) when Len > MaxOfflineMsgs ->
+    true;
+is_message_count_threshold_reached(MaxOfflineMsgs, LUser, LServer, Len) ->
+    %% Only count messages if needed.
+    MaxArchivedMsg = MaxOfflineMsgs - Len,
+    %% Maybe do not need to count all messages in archive
+    MaxArchivedMsg < ?BACKEND:count_offline_messages(LUser, LServer, MaxArchivedMsg + 1).
+
+
+
 get_max_user_messages(AccessRule, LUser, Host) ->
-    case acl:match_rule(Host, AccessRule, jlib:make_jid(LUser, Host, <<>>)) of
-	Max when is_integer(Max) -> Max;
-	infinity -> infinity;
-	_ -> ?MAX_USER_MESSAGES
+    case acl:match_rule(Host, AccessRule, jid:make(LUser, Host, <<>>)) of
+        Max when is_integer(Max) -> Max;
+        infinity -> infinity;
+        _ -> ?MAX_USER_MESSAGES
     end.
 
 receive_all(US, Msgs) ->
     receive
-	#offline_msg{us=US} = Msg ->
-	    receive_all(US, [Msg | Msgs])
+        #offline_msg{us=US} = Msg ->
+            receive_all(US, [Msg | Msgs])
     after 0 ->
-	    Msgs
+              Msgs
     end.
 
 %% Supervision
@@ -174,6 +248,17 @@ srv_name() ->
 srv_name(Host) ->
     gen_mod:get_module_proc(Host, srv_name()).
 
+determine_amp_strategy(Strategy = #amp_strategy{deliver = [none]},
+                       _FromJID, ToJID, _Packet, initial_check) ->
+    #jid{luser = LUser, lserver = LServer} = ToJID,
+    ShouldBeStored = ejabberd_auth:is_user_exists(LUser, LServer),
+    case ShouldBeStored of
+        true -> Strategy#amp_strategy{deliver = [stored, none]};
+        false -> Strategy
+    end;
+determine_amp_strategy(Strategy, _, _, _, _) ->
+    Strategy.
+
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
@@ -186,6 +271,7 @@ srv_name(Host) ->
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
 init([Host, AccessMaxOfflineMsgs]) ->
+    random:seed(os:timestamp()),
     {ok, #state{
             host = Host,
             access_max_user_messages = AccessMaxOfflineMsgs}}.
@@ -261,18 +347,17 @@ add_feature({result, Features}, Feature) ->
 add_feature(_, Feature) ->
     {result, [Feature]}.
 
-inspect_packet(From, To, Packet) ->
-    case is_interesting_packet(Packet) of
+%% This function should be called only from hook
+%% Calling it directly is dangerous and my store unwanted message
+%% in the offline storage (f.e. messages of type error or groupchat)
+%% #rh
+inspect_packet(Acc, From, To, Packet) ->
+    case check_event_chatstates(From, To, Packet) of
         true ->
-            case check_event_chatstates(From, To, Packet) of
-                true ->
-                    store_packet(From, To, Packet),
-                    stop;
-                false ->
-                    ok
-            end;
+            store_packet(From, To, Packet),
+            {stop, Acc};
         false ->
-            ok
+            Acc
     end.
 
 store_packet(
@@ -304,43 +389,34 @@ store_packet(
     Pid ! Msg,
     ok.
 
-is_interesting_packet(Packet) ->
-    Type = xml:get_tag_attr_s(<<"type">>, Packet),
-    is_interesting_packet_type(Type).
-
-is_interesting_packet_type(<<"error">>)     -> false;
-is_interesting_packet_type(<<"groupchat">>) -> false;
-is_interesting_packet_type(<<"headline">>)  -> false;
-is_interesting_packet_type(_)               -> true.
-
 %% Check if the packet has any content about XEP-0022 or XEP-0085
 check_event_chatstates(From, To, Packet) ->
     #xmlel{children = Els} = Packet,
     case find_x_event_chatstates(Els, {false, false, false}) of
-	%% There wasn't any x:event or chatstates subelements
-	{false, false, _} ->
-	    true;
-	%% There a chatstates subelement and other stuff, but no x:event
-	{false, CEl, true} when CEl /= false ->
-	    true;
-	%% There was only a subelement: a chatstates
-	{false, CEl, false} when CEl /= false ->
-	    %% Don't allow offline storage
-	    false;
-	%% There was an x:event element, and maybe also other stuff
-	{El, _, _} when El /= false ->
-	    case xml:get_subtag(El, <<"id">>) of
-		false ->
-		    case xml:get_subtag(El, <<"offline">>) of
-			false ->
-			    true;
-			_ ->
+        %% There wasn't any x:event or chatstates subelements
+        {false, false, _} ->
+            true;
+        %% There a chatstates subelement and other stuff, but no x:event
+        {false, CEl, true} when CEl /= false ->
+            true;
+        %% There was only a subelement: a chatstates
+        {false, CEl, false} when CEl /= false ->
+            %% Don't allow offline storage
+            false;
+        %% There was an x:event element, and maybe also other stuff
+        {El, _, _} when El /= false ->
+            case xml:get_subtag(El, <<"id">>) of
+                false ->
+                    case xml:get_subtag(El, <<"offline">>) of
+                        false ->
+                            true;
+                        _ ->
                 ejabberd_router:route(To, From, patch_offline_message(Packet)),
-			    true
-		    end;
-		_ ->
-		    false
-	    end
+                            true
+                    end;
+                _ ->
+                    false
+            end
     end.
 
 patch_offline_message(Packet) ->
@@ -366,12 +442,12 @@ find_x_event_chatstates([#xmlcdata{} | Els], Res) ->
     find_x_event_chatstates(Els, Res);
 find_x_event_chatstates([El | Els], {A, B, C}) ->
     case xml:get_tag_attr_s(<<"xmlns">>, El) of
-	?NS_EVENT ->
-	    find_x_event_chatstates(Els, {El, B, C});
-	?NS_CHATSTATES ->
-	    find_x_event_chatstates(Els, {A, El, C});
-	_ ->
-	    find_x_event_chatstates(Els, {A, B, true})
+        ?NS_EVENT ->
+            find_x_event_chatstates(Els, {El, B, C});
+        ?NS_CHATSTATES ->
+            find_x_event_chatstates(Els, {A, El, C});
+        _ ->
+            find_x_event_chatstates(Els, {A, B, true})
     end.
 
 find_x_expire(_, []) ->
@@ -380,31 +456,31 @@ find_x_expire(TimeStamp, [#xmlcdata{} | Els]) ->
     find_x_expire(TimeStamp, Els);
 find_x_expire(TimeStamp, [El | Els]) ->
     case xml:get_tag_attr_s(<<"xmlns">>, El) of
-	?NS_EXPIRE ->
-	    Val = xml:get_tag_attr_s(<<"seconds">>, El),
-	    case catch list_to_integer(Val) of
-		{'EXIT', _} ->
-		    never;
-		Int when Int > 0 ->
-		    {MegaSecs, Secs, MicroSecs} = TimeStamp,
-		    S = MegaSecs * 1000000 + Secs + Int,
-		    MegaSecs1 = S div 1000000,
-		    Secs1 = S rem 1000000,
-		    {MegaSecs1, Secs1, MicroSecs};
-		_ ->
-		    never
-	    end;
-	_ ->
-	    find_x_expire(TimeStamp, Els)
+        ?NS_EXPIRE ->
+            Val = xml:get_tag_attr_s(<<"seconds">>, El),
+            case catch list_to_integer(binary_to_list(Val)) of
+                {'EXIT', _} ->
+                    never;
+                Int when Int > 0 ->
+                    {MegaSecs, Secs, MicroSecs} = TimeStamp,
+                    S = MegaSecs * 1000000 + Secs + Int,
+                    MegaSecs1 = S div 1000000,
+                    Secs1 = S rem 1000000,
+                    {MegaSecs1, Secs1, MicroSecs};
+                _ ->
+                    never
+            end;
+        _ ->
+            find_x_expire(TimeStamp, Els)
     end.
 
-pop_offline_messages(Ls, User, Server) ->
-    Ls ++ pop_offline_messages(User, Server).
+pop_offline_messages(Acc, User, Server) ->
+    mongoose_acc:append(offline_messages, pop_offline_messages(User, Server), Acc).
 
 pop_offline_messages(User, Server) ->
-    LUser = jlib:nodeprep(User),
-    LServer = jlib:nameprep(Server),
-    case ?BACKEND:pop_messages(LUser, LServer) of
+    LUser = jid:nodeprep(User),
+    LServer = jid:nameprep(Server),
+    case pop_messages(LUser, LServer) of
         {ok, Rs} ->
             lists:map(fun(R) ->
                 Packet = resend_offline_message_packet(Server, R),
@@ -415,21 +491,23 @@ pop_offline_messages(User, Server) ->
             []
     end.
 
-resend_offline_messages(User, Server) ->
-    LUser = jlib:nodeprep(User),
-    LServer = jlib:nameprep(Server),
+pop_messages(LUser, LServer) ->
     case ?BACKEND:pop_messages(LUser, LServer) of
-        {ok, Rs} ->
-            lists:foreach(fun(R) ->
-                  Packet = resend_offline_message_packet(Server, R),
-                  route_offline_message(R, Packet)
-              end, Rs);
-        {error, _Reason} ->
-            ok
+        {ok, RsAll} ->
+            TimeStamp = os:timestamp(),
+            Rs = skip_expired_messages(TimeStamp, lists:keysort(#offline_msg.timestamp, RsAll)),
+            {ok, Rs};
+        Other ->
+            Other
     end.
 
-route_offline_message(#offline_msg{from=From, to=To}, Packet) ->
-    ejabberd_sm:route(From, To, Packet).
+skip_expired_messages(TimeStamp, Rs) ->
+    [R || R <- Rs, not is_expired_message(TimeStamp, R)].
+
+is_expired_message(_TimeStamp, #offline_msg{expire=never}) ->
+    false;
+is_expired_message(TimeStamp, #offline_msg{expire=ExpireTimeStamp}) ->
+   ExpireTimeStamp < TimeStamp.
 
 compose_offline_message(#offline_msg{from=From, to=To}, Packet) ->
     {route, From, To, Packet}.
@@ -440,23 +518,27 @@ resend_offline_message_packet(Server,
 
 add_timestamp(undefined, _Server, Packet) ->
     Packet;
-add_timestamp({_,_,Micro} = TimeStamp, Server, Packet) ->
-    {D,{H,M,S}} = calendar:now_to_universal_time(TimeStamp),
-    Time = {D,{H,M,S, Micro}},
-    %% TODO: Delete the next element once XEP-0091 is Obsolete
-    TimeStampLegacyXML = timestamp_legacy_xml(Server, Time),
-    TimeStampXML = jlib:timestamp_to_xml(Time),
-    xml:append_subtags(Packet, [TimeStampLegacyXML, TimeStampXML]).
+add_timestamp({_, _, Micro} = TimeStamp, Server, Packet) ->
+    {D, {H, M, S}} = calendar:now_to_universal_time(TimeStamp),
+    Time = {D, {H, M, S, Micro}},
+    TimeStampXML = timestamp_xml(Server, Time),
+    xml:append_subtags(Packet, [TimeStampXML]).
 
-timestamp_legacy_xml(Server, Time) ->
-    FromJID = jlib:make_jid(<<>>, Server, <<>>),
+timestamp_xml(Server, Time) ->
+    FromJID = jid:make(<<>>, Server, <<>>),
     jlib:timestamp_to_xml(Time, utc, FromJID, <<"Offline Storage">>).
 
 remove_expired_messages(Host) ->
     ?BACKEND:remove_expired_messages(Host).
 
 remove_old_messages(Host, Days) ->
-    ?BACKEND:remove_expired_messages(Host, Days).
+    Timestamp = fallback_timestamp(Days, os:timestamp()),
+    ?BACKEND:remove_old_messages(Host, Timestamp).
+
+%% #rh
+remove_user(Acc, User, Server) ->
+    remove_user(User, Server),
+    Acc.
 
 remove_user(User, Server) ->
     ?BACKEND:remove_user(User, Server).
@@ -465,10 +547,16 @@ remove_user(User, Server) ->
 discard_warn_sender(Msgs) ->
     lists:foreach(
       fun(#offline_msg{from=From, to=To, packet=Packet}) ->
-	      ErrText = <<"Your contact offline message queue is full. The message has been discarded.">>,
-	      Lang = xml:get_tag_attr_s(<<"xml:lang">>, Packet),
-	      Err = jlib:make_error_reply(
-		      Packet, ?ERRT_RESOURCE_CONSTRAINT(Lang, ErrText)),
-	      ejabberd_router:route(To, From, Err)
+              ErrText = <<"Your contact offline message queue is full. The message has been discarded.">>,
+              Lang = xml:get_tag_attr_s(<<"xml:lang">>, Packet),
+              amp_failed_event(Packet, From),
+              Err = jlib:make_error_reply(
+                      Packet, ?ERRT_RESOURCE_CONSTRAINT(Lang, ErrText)),
+              ejabberd_router:route(To, From, Err)
       end, Msgs).
 
+fallback_timestamp(Days, {MegaSecs, Secs, _MicroSecs}) ->
+    S = MegaSecs * 1000000 + Secs - 60 * 60 * 24 * Days,
+    MegaSecs1 = S div 1000000,
+    Secs1 = S rem 1000000,
+    {MegaSecs1, Secs1, 0}.

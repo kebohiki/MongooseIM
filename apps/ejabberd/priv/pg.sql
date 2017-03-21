@@ -119,11 +119,9 @@ CREATE TABLE privacy_list (
     username varchar(250) NOT NULL,
     name text NOT NULL,
     id SERIAL UNIQUE,
-    created_at TIMESTAMP NOT NULL DEFAULT now()
+    created_at TIMESTAMP NOT NULL DEFAULT now(),
+    PRIMARY KEY (username,name)
 );
-
-CREATE INDEX i_privacy_list_username ON privacy_list USING btree (username);
-CREATE UNIQUE INDEX i_privacy_list_username_name ON privacy_list USING btree (username, name);
 
 CREATE TABLE privacy_list_data (
     id bigint REFERENCES privacy_list(id) ON DELETE CASCADE,
@@ -135,7 +133,8 @@ CREATE TABLE privacy_list_data (
     match_iq boolean NOT NULL,
     match_message boolean NOT NULL,
     match_presence_in boolean NOT NULL,
-    match_presence_out boolean NOT NULL
+    match_presence_out boolean NOT NULL,
+    PRIMARY KEY (id, ord)
 );
 
 CREATE TABLE private_storage (
@@ -166,13 +165,17 @@ CREATE TABLE roster_version (
 -- UPDATE rosterusers SET askmessage = '';
 -- ALTER TABLE rosterusers ALTER COLUMN askmessage SET NOT NULL;
 
+-- To update from 2.0.0:
+-- ALTER TABLE mam_message ADD COLUMN search_body text;
+-- ALTER TABLE mam_muc_message ADD COLUMN search_body text;
+
 CREATE TYPE mam_behaviour AS ENUM('A', 'N', 'R');
 CREATE TYPE mam_direction AS ENUM('I','O');
 
 CREATE TABLE mam_message(
   -- Message UID (64 bits)
   -- A server-assigned UID that MUST be unique within the archive.
-  id BIGINT NOT NULL PRIMARY KEY,
+  id BIGINT NOT NULL,
   user_id INT NOT NULL,
   -- FromJID used to form a message without looking into stanza.
   -- This value will be send to the client "as is".
@@ -186,12 +189,10 @@ CREATE TABLE mam_message(
   -- Has no meaning for MUC-rooms.
   direction mam_direction NOT NULL,
   -- Term-encoded message packet
-  message bytea NOT NULL
+  message bytea NOT NULL,
+  search_body text,
+  PRIMARY KEY(user_id, id)
 );
-CREATE INDEX i_mam_message_username_id
-    ON mam_message
-    USING BTREE
-    (user_id, id);
 CREATE INDEX i_mam_message_username_jid_id
     ON mam_message
     USING BTREE
@@ -204,20 +205,9 @@ CREATE TABLE mam_config(
   -- A - always archive;
   -- N - never archive;
   -- R - roster (only for remote_jid == "")
-  behaviour mam_behaviour NOT NULL
+  behaviour mam_behaviour NOT NULL,
+  PRIMARY KEY(user_id, remote_jid)
 );
-CREATE INDEX i_mam_config
-    ON mam_config
-    (user_id, remote_jid);
-
-CREATE TABLE mam_user(
-  id SERIAL UNIQUE PRIMARY KEY,
-  user_name varchar(250) NOT NULL
-);
-CREATE UNIQUE INDEX i_mam_user_name
-    ON mam_user
-    USING BTREE
-    (user_name);
 
 CREATE TABLE mam_server_user(
   id SERIAL UNIQUE PRIMARY KEY,
@@ -233,28 +223,66 @@ CREATE UNIQUE INDEX i_mam_server_user_name
 CREATE TABLE mam_muc_message(
   -- Message UID
   -- A server-assigned UID that MUST be unique within the archive.
-  id BIGINT NOT NULL PRIMARY KEY,
+  id BIGINT NOT NULL,
   room_id INT NOT NULL,
   -- A nick of the message's originator
   nick_name varchar(250) NOT NULL,
   -- Term-encoded message packet
-  message bytea NOT NULL
+  message bytea NOT NULL,
+  search_body text,
+  PRIMARY KEY (room_id, id)
 );
-CREATE INDEX i_mam_muc_message_room_name_added_at
-    ON mam_muc_message
-    USING BTREE
-    (room_id, id);
 
 CREATE TABLE offline_message(
-  id SERIAL UNIQUE PRIMARY Key,
-  timestamp BIGINT NOT NULL,
-  expire    BIGINT, 
-  server    varchar(250)    NOT NULL,
-  username  varchar(250)    NOT NULL,
-  from_jid  varchar(250)    NOT NULL,
-  packet    text            NOT NULL
+    id SERIAL UNIQUE PRIMARY Key,
+    timestamp BIGINT NOT NULL,
+    expire    BIGINT,
+    server    varchar(250)    NOT NULL,
+    username  varchar(250)    NOT NULL,
+    from_jid  varchar(250)    NOT NULL,
+    packet    text            NOT NULL
 );
 CREATE INDEX i_offline_message
     ON offline_message
     USING BTREE
     (server, username, id);
+
+CREATE TABLE auth_token(
+    owner   TEXT    NOT NULL PRIMARY KEY,
+    seq_no  BIGINT  NOT NULL
+);
+
+CREATE TABLE muc_light_rooms(
+    id BIGSERIAL            NOT NULL UNIQUE,
+    luser VARCHAR(250)      NOT NULL,
+    lserver VARCHAR(250)    NOT NULL,
+    version VARCHAR(20)     NOT NULL,
+    PRIMARY KEY (lserver, luser)
+);
+
+CREATE TABLE muc_light_occupants(
+    room_id BIGINT          NOT NULL REFERENCES muc_light_rooms(id),
+    luser VARCHAR(250)      NOT NULL,
+    lserver VARCHAR(250)    NOT NULL,
+    aff SMALLINT            NOT NULL
+);
+
+CREATE INDEX i_muc_light_occupants_id ON muc_light_occupants (room_id);
+CREATE INDEX i_muc_light_occupants_us ON muc_light_occupants (lserver, luser);
+
+CREATE TABLE muc_light_config(
+    room_id BIGINT          NOT NULL REFERENCES muc_light_rooms(id),
+    opt VARCHAR(100)        NOT NULL,
+    val VARCHAR(250)        NOT NULL
+);
+
+CREATE INDEX i_muc_light_config ON muc_light_config (room_id);
+
+CREATE TABLE muc_light_blocking(
+    luser VARCHAR(250)      NOT NULL,
+    lserver VARCHAR(250)    NOT NULL,
+    what SMALLINT           NOT NULL,
+    who VARCHAR(500)        NOT NULL
+);
+
+CREATE INDEX i_muc_light_blocking ON muc_light_blocking (luser, lserver);

@@ -62,6 +62,11 @@
 -type format_type() :: binary() | string() | char().
 -type cmd() :: {CallString :: string(), Args :: [string()], Desc :: string()}.
 
+-define(ASCII_SPACE_CHARACTER, $\s).
+-define(PRINT(Format, Args), io:format(lists:flatten(Format), Args)).
+-define(TIME_HMS_FORMAT, "~B days ~2.10.0B:~2.10.0B:~2.10.0B").
+-define(a2l(A), atom_to_list(A)).
+
 %%-----------------------------
 %% Module
 %%-----------------------------
@@ -117,8 +122,7 @@ init() ->
                         Function :: atom()) -> 'ok'.
 register_commands(CmdDescs, Module, Function) ->
     ets:insert(ejabberd_ctl_cmds, CmdDescs),
-    ejabberd_hooks:add(ejabberd_ctl_process,
-                       Module, Function, 50),
+    ejabberd_hooks:add(ejabberd_ctl_process, global, Module, Function, 50),
     ok.
 
 
@@ -129,8 +133,7 @@ unregister_commands(CmdDescs, Module, Function) ->
     lists:foreach(fun(CmdDesc) ->
                           ets:delete_object(ejabberd_ctl_cmds, CmdDesc)
                   end, CmdDescs),
-    ejabberd_hooks:delete(ejabberd_ctl_process,
-                          Module, Function, 50),
+    ejabberd_hooks:delete(ejabberd_ctl_process, global, Module, Function, 50),
     ok.
 
 
@@ -143,20 +146,15 @@ unregister_commands(CmdDescs, Module, Function) ->
 -spec process(_) -> integer().
 process(["status"]) ->
     {InternalStatus, ProvidedStatus} = init:get_status(),
-    ?PRINT("The node ~p is ~p with status: ~p~n",
-           [node(), InternalStatus, ProvidedStatus]),
-    Applications = application:which_applications(),
-    case lists:keyfind(mongooseim, 1, Applications) of
-        false ->
-            EjabberdLogPath = ejabberd_app:get_log_path(),
-            ?PRINT("MongooseIM is not running in that node~n"
-                   "Check for error messages: ~s~n"
-                   "or other files in that directory.~n", [EjabberdLogPath]),
-            ?STATUS_ERROR;
-        {_, _, Version} ->
-            ?PRINT("MongooseIM version ~s is running on that node~n",
-                   [Version]),
-            ?STATUS_SUCCESS
+    MongooseStatus = get_mongoose_status(),
+    ?PRINT("~s", [format_status([{node, node()}, {internal_status, InternalStatus},
+                                 {provided_status, ProvidedStatus},
+                                 {mongoose_status, MongooseStatus},
+                                 {os_pid, os:getpid()}, get_uptime(),
+                                 {logs, get_log_files()}])]),
+    case MongooseStatus of
+        not_running -> ?STATUS_ERROR;
+        {running, _, _Version} -> ?STATUS_SUCCESS
     end;
 process(["stop"]) ->
     %%ejabberd_cover:stop(),
@@ -222,7 +220,8 @@ process(Args) ->
                AccessCommands :: [ejabberd_commands:access_cmd()]
                ) -> {String::string(), Code::integer()}.
 process2(["--auth", User, Server, Pass | Args], AccessCommands) ->
-    process2(Args, {User, Server, Pass}, AccessCommands);
+    process2(Args, {list_to_binary(User), list_to_binary(Server), list_to_binary(Pass)},
+             AccessCommands);
 process2(Args, AccessCommands) ->
     process2(Args, noauth, AccessCommands).
 
@@ -230,21 +229,15 @@ process2(Args, AccessCommands) ->
 %% @private
 process2(Args, Auth, AccessCommands) ->
     case try_run_ctp(Args, Auth, AccessCommands) of
-        {String, wrong_command_arguments}
-        when is_list(String) ->
+        {String, wrong_command_arguments} when is_list(String) ->
             io:format(lists:flatten(["\n" | String]++["\n"])),
             [CommandString | _] = Args,
             process(["help" | [CommandString]]),
             {lists:flatten(String), ?STATUS_ERROR};
-        {String, Code}
-        when is_list(String) and is_integer(Code) ->
+        {String, Code} when is_list(String) and is_integer(Code) ->
             {lists:flatten(String), Code};
-        String
-        when is_list(String) ->
+        String when is_list(String) ->
             {lists:flatten(String), ?STATUS_SUCCESS};
-        Code
-        when is_integer(Code) ->
-            {"", Code};
         Other ->
             {"Erroneous result: " ++ io_lib:format("~p", [Other]), ?STATUS_ERROR}
     end.
@@ -295,8 +288,6 @@ try_call_command(Args, Auth, AccessCommands) ->
     try call_command(Args, Auth, AccessCommands) of
         {error, command_unknown} ->
             {io_lib:format("Error: command ~p not known.", [hd(Args)]), ?STATUS_ERROR};
-        {error, wrong_number_parameters} ->
-            {"Error: wrong number of parameters", ?STATUS_ERROR};
         Res ->
             Res
     catch
@@ -315,24 +306,24 @@ call_command([CmdString | Args], Auth, AccessCommands) ->
     CmdStringU = re:replace(CmdString, "-", "_", [global, {return, list}]),
     Command = list_to_atom(CmdStringU),
     case ejabberd_commands:get_command_format(Command) of
-	{error, command_unknown} ->
-	    {error, command_unknown};
-	{ArgsFormat, ResultFormat} ->
-	    case (catch format_args(Args, ArgsFormat)) of
-		ArgsFormatted when is_list(ArgsFormatted) ->
-		    Result = ejabberd_commands:execute_command(AccessCommands, Auth, Command,
-							       ArgsFormatted),
-		    format_result(Result, ResultFormat);
-		{'EXIT', {function_clause,[{lists,zip,[A1, A2], _FileInfo} | _]}} ->
-		    {NumCompa, TextCompa} =
-			case {length(A1), length(A2)} of
-			    {L1, L2} when L1 < L2 -> {L2-L1, "less argument"};
-			    {L1, L2} when L1 > L2 -> {L1-L2, "more argument"}
-			end,
-		    {io_lib:format("Error: the command ~p requires ~p ~s.",
-				   [CmdString, NumCompa, TextCompa]),
-		     wrong_command_arguments}
-	    end
+        {error, command_unknown} ->
+            {error, command_unknown};
+        {ArgsFormat, ResultFormat} ->
+            case (catch format_args(Args, ArgsFormat)) of
+                ArgsFormatted when is_list(ArgsFormatted) ->
+                    Result = ejabberd_commands:execute_command(AccessCommands, Auth, Command,
+                                                               ArgsFormatted),
+                    format_result(Result, ResultFormat);
+                {'EXIT', {function_clause, [{lists, zip, [A1, A2], _FileInfo} | _]}} ->
+                    {NumCompa, TextCompa} =
+                        case {length(A1), length(A2)} of
+                            {L1, L2} when L1 < L2 -> {L2-L1, "less argument"};
+                            {L1, L2} when L1 > L2 -> {L1-L2, "more argument"}
+                        end,
+                    {io_lib:format("Error: the command ~p requires ~p ~s.",
+                                   [CmdString, NumCompa, TextCompa]),
+                     wrong_command_arguments}
+            end
     end.
 
 
@@ -341,7 +332,7 @@ call_command([CmdString | Args], Auth, AccessCommands) ->
 %%-----------------------------
 
 %% @private
--spec args_join_xml(string()) -> string().
+-spec args_join_xml([string()]) -> [string()].
 args_join_xml([]) ->
     [];
 args_join_xml([ [ $< | _ ] = Arg | RArgs ]) ->
@@ -364,7 +355,7 @@ args_join_strings([ "\"", NextArg | RArgs ]) ->
     args_join_strings([ "\"" ++ NextArg | RArgs ]);
 args_join_strings([ [ $" | _ ] = Arg | RArgs ]) ->
     case lists:nthtail(length(Arg)-2, Arg) of
-        [C1, $"] when C1 /= $\ ->
+        [C1, $"] when C1 /= ?ASCII_SPACE_CHARACTER ->
             [ string:substr(Arg, 2, length(Arg)-2) | args_join_strings(RArgs) ];
         _ ->
             [NextArg | RArgs1] = RArgs,
@@ -384,7 +375,7 @@ bal(String, Left, Right) ->
 -spec bal(string(), L :: char(), R :: char(), Bal :: integer()) -> boolean().
 bal([], _Left, _Right, Bal) ->
     Bal == 0;
-bal([$\ , _NextChar | T], Left, Right, Bal) ->
+bal([?ASCII_SPACE_CHARACTER, _NextChar | T], Left, Right, Bal) ->
     bal(T, Left, Right, Bal);
 bal([Left | T], Left, Right, Bal) ->
     bal(T, Left, Right, Bal-1);
@@ -448,7 +439,7 @@ format_result(String, {_Name, string}) ->
 format_result(Binary, {_Name, binary}) ->
     io_lib:format("~s", [Binary]);
 format_result(Code, {_Name, rescode}) ->
-    make_status(Code);
+    {"", make_status(Code)};
 format_result({Code, Text}, {_Name, restuple}) ->
     {io_lib:format("~s", [Text]), make_status(Code)};
 %% The result is a list of something: [something()]
@@ -463,7 +454,7 @@ format_result([FirstElement | Elements], {_Name, {list, ElementsDef}}) ->
                ["\n" | format_result(Element, ElementsDef)]
        end,
        Elements)];
-%% The result is a tuple with several elements: {something1(), something2(),...}
+%% The result is a tuple with several elements: {something1(), something2(), ...}
 %% NOTE: the elements in the tuple are separated with tabular characters,
 %% if a string is empty, it will be difficult to notice in the shell,
 %% maybe a different separation character should be used, like ;;?
@@ -490,7 +481,7 @@ get_list_commands() ->
     try ejabberd_commands:list_commands() of
         Commands ->
             [tuple_command_help(Command)
-             || {N,_,_}=Command <- Commands,
+             || {N, _, _}=Command <- Commands,
                 %% Don't show again those commands, because they are already
                 %% announced by ejabberd_ctl itself
                 N /= status, N /= stop, N /= restart]
@@ -503,22 +494,8 @@ get_list_commands() ->
 -spec tuple_command_help(ejabberd_commands:list_cmd()) -> cmd().
 tuple_command_help({Name, Args, Desc}) ->
     Arguments = [atom_to_list(ArgN) || {ArgN, _ArgF} <- Args],
-    Prepend = case is_supported_args(Args) of
-                  true -> "";
-                  false -> "*"
-              end,
     CallString = atom_to_list(Name),
-    {CallString, Arguments, Prepend ++ Desc}.
-
-
--spec is_supported_args([{atom(),_}]) -> boolean().
-is_supported_args(Args) ->
-    lists:all(
-      fun({_Name, Format}) ->
-              (Format == integer)
-                  or (Format == string)
-      end,
-      Args).
+    {CallString, Arguments, Desc}.
 
 
 -spec get_list_ctls() -> [cmd()].
@@ -528,6 +505,21 @@ get_list_ctls() ->
         Cs -> [{NameArgs, [], Desc} || {NameArgs, Desc} <- Cs]
     end.
 
+format_status([{node, Node}, {internal_status, IS}, {provided_status, PS},
+               {mongoose_status, MS}, {os_pid, OSPid}, {uptime, UptimeHMS},
+               {logs, LogFiles}]) ->
+    ( ["MongooseIM node ", ?a2l(Node), ":\n",
+       "    operating system pid: ", OSPid, "\n",
+       "    Erlang VM status: ", ?a2l(IS), " (of: starting | started | stopping)\n",
+       "    boot script status: ", io_lib:format("~p", [PS]), "\n",
+       "    version: ", case MS of
+                          {running, App, Version} -> [Version, " (as ", ?a2l(App), ")"];
+                          not_running -> "unavailable - neither ejabberd nor mongooseim is running"
+                        end, "\n",
+       "    uptime: ", io_lib:format(?TIME_HMS_FORMAT, UptimeHMS), "\n"] ++
+      ["    logs: none - maybe enable logging to a file in app.config?\n" || LogFiles == [] ] ++
+      ["    logs:\n" || LogFiles /= [] ] ++ [
+      ["        ", LogFile, "\n"] || LogFile <- LogFiles ] ).
 
 %%-----------------------------
 %% Print help
@@ -549,8 +541,8 @@ print_usage() ->
 
 
 -spec print_usage('dual' | 'long'
-                 , MaxC :: integer()
-                 , ShCode :: boolean()) -> 'ok'.
+                , MaxC :: integer()
+                , ShCode :: boolean()) -> 'ok'.
 print_usage(HelpMode, MaxC, ShCode) ->
     AllCommands =
         [
@@ -580,7 +572,7 @@ print_usage(HelpMode, MaxC, ShCode) ->
 -spec print_usage_commands(HelpMode :: 'dual' | 'long',
                            MaxC :: integer(),
                            ShCode :: boolean(),
-                           Commands :: [cmd(),...]) -> 'ok'.
+                           Commands :: [cmd(), ...]) -> 'ok'.
 print_usage_commands(HelpMode, MaxC, ShCode, Commands) ->
     CmdDescsSorted = lists:keysort(1, Commands),
 
@@ -613,21 +605,18 @@ print_usage_commands(HelpMode, MaxC, ShCode, Commands) ->
 
 %% @doc Get some info about the shell: how many columns of width and guess if
 %% it supports text formatting codes.
--spec get_shell_info() -> {integer(),boolean()}.
+-spec get_shell_info() -> {integer(), boolean()}.
 get_shell_info() ->
-    %% This function was introduced in OTP R12B-0
-    try io:columns() of
+    case io:columns() of
         {ok, C} -> {C-2, true};
         {error, enotsup} -> {78, false}
-    catch
-        _:_ -> {78, false}
     end.
 
 
 %% @doc Split this command description in several lines of proper length
 -spec prepare_description(DescInit :: non_neg_integer(),
                           MaxC :: integer(),
-                          Desc :: string()) -> [[[any()]],...].
+                          Desc :: string()) -> [[[any()]], ...].
 prepare_description(DescInit, MaxC, Desc) ->
     Words = string:tokens(Desc, " "),
     prepare_long_line(DescInit, MaxC, Words).
@@ -636,17 +625,17 @@ prepare_description(DescInit, MaxC, Desc) ->
 -spec prepare_long_line(DescInit :: non_neg_integer(),
                         MaxC :: integer(),
                         Words :: [nonempty_string()]
-                        ) -> [[[any()]],...].
+                        ) -> [[[any()]], ...].
 prepare_long_line(DescInit, MaxC, Words) ->
     MaxSegmentLen = MaxC - DescInit,
-    MarginString = lists:duplicate(DescInit, $\s), % Put spaces
+    MarginString = lists:duplicate(DescInit, ?ASCII_SPACE_CHARACTER), % Put spaces
     [FirstSegment | MoreSegments] = split_desc_segments(MaxSegmentLen, Words),
     MoreSegmentsMixed = mix_desc_segments(MarginString, MoreSegments),
     [FirstSegment | MoreSegmentsMixed].
 
 
 -spec mix_desc_segments(MarginStr :: [any()],
-                        Segments :: [[[any(),...]]]) -> [[[any()],...]].
+                        Segments :: [[[any(), ...]]]) -> [[[any()], ...]].
 mix_desc_segments(MarginString, Segments) ->
     [["\n", MarginString, Segment] || Segment <- Segments].
 
@@ -656,7 +645,7 @@ split_desc_segments(MaxL, Words) ->
 
 %% @doc Join words in a segment, but stop adding to a segment if adding this
 %% word would pass L
--spec join(L :: number(), Words :: [nonempty_string()]) -> [[[any(),...]],...].
+-spec join(L :: number(), Words :: [nonempty_string()]) -> [[[any(), ...]], ...].
 join(L, Words) ->
     join(L, Words, 0, [], []).
 
@@ -665,7 +654,7 @@ join(L, Words) ->
            Words :: [nonempty_string()],
            LenLastSeg :: non_neg_integer(),
            LastSeg :: [nonempty_string()],
-           ResSeg :: [[[any(),...]]] ) -> [[[any(),...]],...].
+           ResSeg :: [[[any(), ...]]] ) -> [[[any(), ...]], ...].
 join(_L, [], _LenLastSeg, LastSeg, ResSeg) ->
     ResSeg2 = [lists:reverse(LastSeg) | ResSeg],
     lists:reverse(ResSeg2);
@@ -686,11 +675,11 @@ join(L, [Word | Words], LenLastSeg, LastSeg, ResSeg) ->
     end.
 
 
--spec format_command_lines(CALD :: [{[any()],[any()],number(),_},...],
+-spec format_command_lines(CALD :: [{[any()], [any()], number(), _}, ...],
                            MaxCmdLen :: integer(),
                            MaxC :: integer(),
                            ShCode :: boolean(),
-                           'dual' | 'long') -> [[any(),...],...].
+                           'dual' | 'long') -> [[any(), ...], ...].
 format_command_lines(CALD, MaxCmdLen, MaxC, ShCode, dual)
   when MaxC - MaxCmdLen < 40 ->
     %% If the space available for descriptions is too narrow, enforce long help mode
@@ -699,7 +688,7 @@ format_command_lines(CALD, MaxCmdLen, MaxC, ShCode, dual) ->
     lists:map(
       fun({Cmd, Args, CmdArgsL, Desc}) ->
               DescFmt = prepare_description(MaxCmdLen+4, MaxC, Desc),
-              ["  ", ?B(Cmd), " ", [[?U(Arg), " "] || Arg <- Args], string:chars($\s, MaxCmdLen - CmdArgsL + 1),
+              ["  ", ?B(Cmd), " ", [[?U(Arg), " "] || Arg <- Args], string:chars(?ASCII_SPACE_CHARACTER, MaxCmdLen - CmdArgsL + 1),
                DescFmt, "\n"]
       end, CALD);
 format_command_lines(CALD, _MaxCmdLen, MaxC, ShCode, long) ->
@@ -759,11 +748,11 @@ print_usage_help(MaxC, ShCode) ->
         ["The special 'help' mongooseimctl command provides help of MongooseIM commands.\n\n"
          "The format is:\n  ", ?B("mongooseimctl"), " ", ?B("help"), " [", ?B("--tags"), " ", ?U("[tag]"), " | ", ?U("com?*"), "]\n\n"
          "The optional arguments:\n"
-         "  ",?B("--tags"),"      Show all tags and the names of commands in each tag\n"
-         "  ",?B("--tags"), " ", ?U("tag"),"  Show description of commands in this tag\n"
-         "  ",?U("command"),"     Show detailed description of the command\n"
-         "  ",?U("com?*"),"       Show detailed description of commands that match this glob.\n"
-         "              You can use ? to match a simple character,\n"
+         "  ", ?B("--tags"), "      Show all tags and the names of commands in each tag\n"
+         "  ", ?B("--tags"), " ", ?U("tag"), "  Show description of commands in this tag\n"
+         "  ", ?U("command"), "     Show detailed description of the command\n"
+         "  ", ?U("com?*"), "       Show detailed description of commands that match this glob.\n"
+         "              You can use ? to match a simple character, \n"
          "              and * to match several characters.\n"
          "\n",
          "Some example usages:\n",
@@ -773,14 +762,17 @@ print_usage_help(MaxC, ShCode) ->
          " mongooseimctl help register\n",
          " mongooseimctl help regist*\n",
          "\n",
-         "Please note that 'mongooseimctl help' shows all MongooseIM commands,\n",
+         "Please note that 'mongooseimctl help' shows all MongooseIM commands, \n",
          "even those that cannot be used in the shell with mongooseimctl.\n",
          "Those commands can be identified because the description starts with: *"],
     ArgsDef = [],
     C = #ejabberd_commands{
+      name = help,
       desc = "Show help of MongooseIM commands",
-      longdesc = LongDesc,
+      longdesc = lists:flatten(LongDesc),
       args = ArgsDef,
+      module = none,
+      function = none,
       result = {help, string}},
     print_usage_command("help", C, MaxC, ShCode).
 
@@ -859,7 +851,7 @@ print_usage_command(Cmd, C, MaxC, ShCode) ->
 
     %% Initial indentation of result is 13 = length("  Arguments: ")
     Args = [format_usage_ctype(ArgDef, 13) || ArgDef <- ArgsDef],
-    ArgsMargin = lists:duplicate(13, $\s),
+    ArgsMargin = lists:duplicate(13, ?ASCII_SPACE_CHARACTER),
     ArgsListFmt = case Args of
                       [] -> "\n";
                       _ -> [ [Arg, "\n", ArgsMargin] || Arg <- Args]
@@ -868,25 +860,18 @@ print_usage_command(Cmd, C, MaxC, ShCode) ->
 
     %% Initial indentation of result is 11 = length("  Returns: ")
     ResultFmt = format_usage_ctype(ResultDef, 11),
-    ReturnsFmt = ["  ",?B("Returns"),": ", ResultFmt],
+    ReturnsFmt = ["  ", ?B("Returns"), ": ", ResultFmt],
 
-    XmlrpcFmt = "", %%+++ ["  ",?B("XML-RPC"),": ", format_usage_xmlrpc(ArgsDef, ResultDef), "\n\n"],
+    TagsFmt = ["  ", ?B("Tags"), ": ", prepare_long_line(8, MaxC, [atom_to_list(TagA) || TagA <- TagsAtoms])],
 
-    TagsFmt = ["  ",?B("Tags"),": ", prepare_long_line(8, MaxC, [atom_to_list(TagA) || TagA <- TagsAtoms])],
-
-    DescFmt = ["  ",?B("Description"),": ", prepare_description(15, MaxC, Desc)],
+    DescFmt = ["  ", ?B("Description"), ": ", prepare_description(15, MaxC, Desc)],
 
     LongDescFmt = case LongDesc of
                       "" -> "";
                       _ -> ["", prepare_description(0, MaxC, LongDesc), "\n\n"]
                   end,
 
-    NoteEjabberdctl = case is_supported_args(ArgsDef) of
-                          true -> "";
-                          false -> ["  ", ?B("Note:"), " This command cannot be executed using mongooseimctl.\n\n"]
-                      end,
-
-    ?PRINT(["\n", NameFmt, "\n", ArgsFmt, "\n", ReturnsFmt, "\n\n", XmlrpcFmt, TagsFmt, "\n\n", DescFmt, "\n\n", LongDescFmt, NoteEjabberdctl], []).
+    ?PRINT(["\n", NameFmt, "\n", ArgsFmt, "\n", ReturnsFmt, "\n\n", TagsFmt, "\n\n", DescFmt, "\n\n", LongDescFmt], []).
 
 
 format_usage_ctype(Type, _Indentation)
@@ -910,19 +895,42 @@ format_usage_ctype({Name, {tuple, ElementsDef}}, Indentation) ->
 format_usage_tuple([], _Indentation) ->
     [];
 format_usage_tuple([ElementDef], Indentation) ->
-    [format_usage_ctype(ElementDef, Indentation) , " }"];
+    [format_usage_ctype(ElementDef, Indentation), " }"];
 format_usage_tuple([ElementDef | ElementsDef], Indentation) ->
     ElementFmt = format_usage_ctype(ElementDef, Indentation),
-    MarginString = lists:duplicate(Indentation, $\s), % Put spaces
-    [ElementFmt, ",\n", MarginString, format_usage_tuple(ElementsDef, Indentation)].
+    MarginString = lists:duplicate(Indentation, ?ASCII_SPACE_CHARACTER), % Put spaces
+    [ElementFmt, ", \n", MarginString, format_usage_tuple(ElementsDef, Indentation)].
 
+get_mongoose_status() ->
+    case lists:keyfind(mongooseim, 1, application:which_applications()) of
+        false -> get_ejabberd_status();
+        {_, _, Version} ->
+            {running, mongooseim, Version}
+    end.
+
+get_ejabberd_status() ->
+    case lists:keyfind(ejabberd, 1, application:which_applications()) of
+        false -> not_running;
+        {_, _, "2.1.8+mim-" ++ Version} ->
+            {running, ejabberd, Version}
+    end.
+
+get_uptime() ->
+    {MilliSeconds, _} = erlang:statistics(wall_clock),
+    {D, {H, M, S}} = calendar:seconds_to_daystime(MilliSeconds div 1000),
+    {uptime, [D, H, M, S]}.
 
 %%-----------------------------
-%% Command managment
+%% Lager specific helpers
 %%-----------------------------
 
-%%+++
-%% Struct(Integer res) create_account(Struct(String user, String server, String password))
-%%format_usage_xmlrpc(ArgsDef, ResultDef) ->
-%%    ["aaaa bbb ccc"].
+get_log_files() ->
+    Handlers = case catch sys:get_state(lager_event) of
+                   {'EXIT', _} -> [];
+                   Hs when is_list(Hs) -> Hs
+               end,
+    [ file_backend_path(State)
+      || {lager_file_backend, _File, State} <- Handlers ].
 
+file_backend_path(LagerFileBackendState) when element(1, LagerFileBackendState) =:= state ->
+    element(2, LagerFileBackendState).

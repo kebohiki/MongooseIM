@@ -124,11 +124,11 @@
 %%%
 %%% When your module is initialized or started, register your commands:
 %%%
-%%% <pre>ejabberd_commands:register_commands(commands()),</pre>
+%%% <pre>ejabberd_commands:register_commands(commands()), </pre>
 %%%
 %%% And when your module is stopped, unregister your commands:
 %%%
-%%% <pre>ejabberd_commands:unregister_commands(commands()),</pre>
+%%% <pre>ejabberd_commands:unregister_commands(commands()), </pre>
 %%%
 %%% That's all! Now when your module is started, the command will be
 %%% registered and any frontend can access it. For example:
@@ -165,10 +165,8 @@
 %%%
 %%% == Frontend to ejabberd commands ==
 %%%
-%%% Currently there are two frontends to ejabberd commands: the shell
-%%% script {@link ejabberd_ctl. mongooseimctl}, and the XML-RPC server
-%%% ejabberd_xmlrpc.
-%%%
+%%% Currently there is one frontend to ejabberd commands: the shell
+%%% script - mongooseimctl
 %%%
 %%% === mongooseimctl as a frontend to ejabberd commands ===
 %%%
@@ -184,8 +182,7 @@
 %%% TODO: consider this feature:
 %%% All commands are catched. If an error happens, return the restuple:
 %%%   {error, flattened error string}
-%%% This means that ecomm call APIs (ejabberd_ctl, ejabberd_xmlrpc) need to allows this.
-%%% And ejabberd_xmlrpc must be prepared to handle such an unexpected response.
+%%% This means that ecomm call APIs ejabberd_ctl need to allows this.
 
 
 -module(ejabberd_commands).
@@ -206,10 +203,10 @@
 -include("ejabberd.hrl").
 
 %% Allowed types for arguments are integer, string, tuple and list.
--type atype() :: integer | string | {tuple, [aterm()]} | {list, aterm()}.
+-type atype() :: integer | string | binary | {tuple, [aterm()]} | {list, aterm()}.
 
 %% A rtype is either an atom or a tuple with two elements.
--type rtype() :: integer | string | atom | {tuple, [rterm()]}
+-type rtype() :: integer | string | atom | binary | {tuple, [rterm()]}
                | {list, rterm()} | rescode | restuple.
 
 %% An argument term is a tuple with the term name and the term type.
@@ -218,10 +215,18 @@
 %% A result term is a tuple with the term name and the term type.
 -type rterm() :: {Name::atom(), Type::rtype()}.
 
--type cmd() :: #ejabberd_commands{}.
+-type cmd() :: #ejabberd_commands{
+                  name :: atom(),
+                  tags :: [atom()],
+                  desc :: string(),
+                  longdesc :: string(),
+                  module :: module(),
+                  function :: atom(),
+                  args :: [ejabberd_commands:aterm()],
+                  result :: ejabberd_commands:rterm()
+                 }.
 
-%% TODO: should this be binary?
--type auth() :: {User::string(), Server::string(), Password::string()} | noauth.
+-type auth() :: {User :: binary(), Server :: binary(), Password :: binary()} | noauth.
 
 -type cmd_error() :: command_unknown | account_unprivileged
                    | invalid_account_data | no_auth_provided.
@@ -240,8 +245,13 @@
 
 
 init() ->
-    ets:new(ejabberd_commands, [named_table, set, public,
-                                {keypos, #ejabberd_commands.name}]).
+    case ets:info(ejabberd_commands) of
+        undefined ->
+            ets:new(ejabberd_commands, [named_table, set, public,
+                                        {keypos, #ejabberd_commands.name}]);
+        _ ->
+            ok
+    end.
 
 
 %% @doc Register ejabberd commands. If a command is already registered, a
@@ -406,9 +416,7 @@ check_access_commands(AccessCommands, Auth, Method, Command, Arguments) ->
 
 %% @private
 %% May throw {error, invalid_account_data}
--spec check_auth(auth()) -> 'no_auth_provided' | none().
-check_auth(noauth) ->
-    no_auth_provided;
+-spec check_auth(auth()) -> {ok, User :: binary(), Server :: binary()} | no_return().
 check_auth({User, Server, Password}) ->
     %% Check the account exists and password is valid
     AccountPass = ejabberd_auth:get_password_s(User, Server),
@@ -420,25 +428,27 @@ check_auth({User, Server, Password}) ->
     end.
 
 
--spec get_md5(string()) -> string().
+-spec get_md5(iodata()) -> string().
 get_md5(AccountPass) ->
     lists:flatten([io_lib:format("~.16B", [X])
-		           || X <- binary_to_list(crypto:hash(md5, AccountPass))]).
+                   || X <- binary_to_list(crypto:hash(md5, AccountPass))]).
 
 
 -spec check_access(Access :: acl:rule(), Auth :: auth()) -> boolean().
 check_access(all, _) ->
     true;
+check_access(_, noauth) ->
+    false;
 check_access(Access, Auth) ->
     {ok, User, Server} = check_auth(Auth),
     %% Check this user has access permission
-    case acl:match_rule(Server, Access, jlib:make_jid(User, Server, <<"">>)) of
+    case acl:match_rule(Server, Access, jid:make(User, Server, <<"">>)) of
         allow -> true;
         deny -> false
     end.
 
 
--spec check_access_command(_,tuple(),_,_,_) -> boolean().
+-spec check_access_command(_, tuple(), _, _, _) -> boolean().
 check_access_command(Commands, Command, ArgumentRestrictions, Method, Arguments) ->
     case Commands==all orelse lists:member(Method, Commands) of
         true -> check_access_arguments(Command, ArgumentRestrictions, Arguments);
@@ -461,8 +471,8 @@ check_access_arguments(Command, ArgumentRestrictions, Arguments) ->
       end, ArgumentRestrictions).
 
 
--spec tag_arguments(ArgsDefs :: [{atom(), integer() | string() | {_,_}}],
-                    Args :: [any()] ) -> [{_,_}].
+-spec tag_arguments(ArgsDefs :: [{atom(), integer() | string() | {_, _}}],
+                    Args :: [any()] ) -> [{_, _}].
 tag_arguments(ArgsDefs, Args) ->
     lists:zipwith(
       fun({ArgName, _ArgType}, ArgValue) ->

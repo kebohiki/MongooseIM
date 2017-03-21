@@ -23,17 +23,17 @@
 
 -record(adhoc_request, {lang :: ejabberd:lang(),
                         node :: ejabberd:server(),
-                        sessionid :: binary(),
+                        session_id :: binary(),
                         action :: binary(),
-                        xdata :: jlib:xmlel(),
+                        xdata :: jlib:xmlel() | false,
                         others
                        }).
 
 -record(adhoc_response, {lang :: ejabberd:lang(),
                          node :: ejabberd:server(),
-                         sessionid :: binary(),
+                         session_id :: binary(),
                          status :: atom(),
-                         defaultaction = "" :: string(),
+                         default_action = <<>> :: binary(),
                          actions = [],
                          notes = [] :: [tuple()],
                          elements = [] :: [jlib:xmlel()]

@@ -1,45 +1,91 @@
 language: erlang
+dist: trusty
+sudo: required
+addons:
+    apt:
+        packages:
+        - libpam0g-dev
+        - libexpat1-dev
+        - odbc-postgresql
+        - slapd
+        - ldap-utils
 before_install:
-        - sudo apt-get install libpam0g-dev libexpat1-dev odbc-postgresql libmyodbc
-        - if [ $PRESET = 'ldap_mnesia' ]; then sudo apt-get install slapd ldap-utils; fi
+        - curl -L https://github.com/docker/compose/releases/download/1.11.2/docker-compose-`uname -s`-`uname -m` > docker-compose
+        - chmod +x docker-compose
+        - sudo mv docker-compose /usr/local/bin
         - tools/travis-generate-pass.sh
-        - tools/travis-check-tests-branch.sh
-install: tools/travis-build.sh
+        - tools/configure $REL_CONFIG
+install:
+        - ./rebar3 compile
+        - make dev
+        - tools/travis-build-tests.sh
 before_script:
         - tools/travis-setup-db.sh
-        - if [ $PRESET = 'ldap_mnesia' ]; then tools/travis-setup-ldap.sh; fi
-script: tools/travis-test.sh
+        - if [ $PRESET = 'ldap_mnesia' ]; then sudo tools/travis-setup-ldap.sh; fi
+script: tools/travis-test.sh -p $PRESET
 
-after_script:
+after_failure:
         - cat `ls -1 -d -t apps/ejabberd/logs/ct_run* | head -1`/apps.ejabberd.logs/run.*/suite.log
-        - tail -100 dev/mongooseim_node1/log/ejabberd.log
-        - if [ -s dev/mongooseim_node1/log/crash.log ]; then cat dev/mongooseim_node1/log/crash.log; fi
-        - tail -100 dev/mongooseim_node2/log/ejabberd.log
-        - if [ -s dev/mongooseim_node2/log/crash.log ]; then cat dev/mongooseim_node2/log/crash.log; fi
-        - cat `ls -1 -d -t test/ejabberd_tests/ct_report/ct_run.* | head -1`/ejabberd_tests.*/run.*/suite.log
-        - cat dev/mongooseim_node1/etc/ejabberd.cfg
+        - if [ -s _build/mim1/rel/mongooseim/log/crash.log ]; then cat _build/mim1/rel/mongooseim/log/crash.log; fi
+        - if [ -s _build/mim2/rel/mongooseim/log/crash.log ]; then cat _build/mim2/rel/mongooseim/log/crash.log; fi
+        - tail -100 _build/mim1/rel/mongooseim/log/ejabberd.log
+        - tail -100 _build/mim2/rel/mongooseim/log/ejabberd.log
 
 after_success:
-        - make cover_report
+        - ./rebar3 coveralls send
+        - if [ $PRESET = 'internal_mnesia' ] && [ $TRAVIS_OTP_RELEASE = "18.3" ]; then tools/travis-build-and-push-docker.sh; fi
 
-services: redis-server
+after_script:
+        - sudo pip install awscli --ignore-installed six
+        - if [ $TRAVIS_SECURE_ENV_VARS == 'true' ]; then tools/travis-upload-to-s3.sh; fi
+
+services:
+        - redis-server
+        - docker
+
 branches:
         only:
                 - master
-notifications:
-        email: mongoose-im@erlang-solutions.com
+                - stable
+                - /^rel\-\d+\.\d+$/
+                - /^\d+\.\d+\.\d+([a-z0-9\-\+])*/
+
 otp_release:
-        - R16B03
+        - 18.3
 env:
-        - PRESET=internal_redis DB=mnesia REL_CONFIG=with-redis
-        - PRESET=internal_mnesia DB=mnesia
-        - PRESET=mysql_mnesia DB=mysql REL_CONFIG=with-mysql
+        - PRESET=internal_mnesia DB=mnesia REL_CONFIG=with-all
+        - PRESET=mysql_redis DB=mysql REL_CONFIG="with-mysql with-redis"
         - PRESET=odbc_pgsql_mnesia DB=pgsql REL_CONFIG=with-odbc
-        - PRESET=pgsql_mnesia DB=pgsql REL_CONFIG=with-pgsql
-        - PRESET=ldap_mnesia DB=mnesia
-        - PRESET=external_mnesia DB=mnesia
+        - PRESET=ldap_mnesia DB=mnesia REL_CONFIG=with-none
+        - PRESET=riak_mnesia DB=riak REL_CONFIG=with-riak
+        - PRESET=cassandra_mnesia DB=cassandra REL_CONFIG=with-cassandra CASSANDRA_VERSION=3.9
 
 matrix:
     include:
-        - otp_release: R15B03
-          env: PRESET=internal_mnesia DB=mnesia
+        - otp_release: 19.2
+          env: PRESET=dialyzer_only
+        - otp_release: 19.2
+          env: PRESET=pgsql_mnesia DB=pgsql REL_CONFIG=with-pgsql
+        - otp_release: 17.5
+          env: PRESET=internal_mnesia DB=mnesia REL_CONFIG=with-none
+
+notifications:
+    webhooks:
+        # trigger Buildtime Trend Service to parse Travis CI log
+        - https://buildtimetrend.herokuapp.com/travis
+        - http://tide.erlang-solutions.com/api/travis_ci/events
+    on_start: always
+
+cache:
+        directories:
+                - $HOME/.cache/rebar3
+
+deploy:
+  provider: releases
+  api-key: $GITHUB_TOKEN
+  skip_cleanup: true
+  file: mongooseim-$TRAVIS_BRANCH.OTP-$TRAVIS_OTP_RELEASE.$(lsb_release -is | tr "A-Z" "a-z").$(lsb_release -rs).$(uname -m).tar.bz2
+  on:
+    tags: true
+    condition: "$PRESET.$TRAVIS_OTP_RELEASE = internal_mnesia.18.3"
+

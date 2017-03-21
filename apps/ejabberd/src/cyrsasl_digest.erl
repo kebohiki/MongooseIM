@@ -29,7 +29,7 @@
 
 -export([start/1,
          stop/0,
-         mech_new/4,
+         mech_new/2,
          mech_step/2]).
 
 -include("ejabberd.hrl").
@@ -38,35 +38,30 @@
 
 -record(state, {step :: integer(),
                 nonce,
-                username :: ejabberd:user(),
+                username :: ejabberd:user() | undefined,
                 authzid,
-                get_password :: cyrsasl:get_password_fun(),
-                check_password :: cyrsasl:check_password_fun(),
                 auth_module :: ejabberd_auth:authmodule(),
-                host :: ejabberd:server()
+                host :: ejabberd:server(),
+                creds :: mongoose_credentials:t()
               }).
 
 start(_Opts) ->
-    cyrsasl:register_mechanism(<<"DIGEST-MD5">>, ?MODULE, digest).
+    mongoose_fips:maybe_register_mech(<<"DIGEST-MD5">>, ?MODULE, digest).
 
 stop() ->
     ok.
 
 -spec mech_new(Host :: ejabberd:server(),
-               GetPassword :: cyrsasl:get_password_fun(),
-               CheckPassword :: cyrsasl:check_password_fun(),
-               CheckPasswordDigest :: cyrsasl:check_pass_digest_fun()
-               ) -> {ok, tuple()}.
-mech_new(Host, GetPassword, _CheckPassword, CheckPasswordDigest) ->
+               Creds :: mongoose_credentials:t()) -> {ok, #state{}}.
+mech_new(Host, Creds) ->
     {ok, #state{step = 1,
                 nonce = randoms:get_string(),
                 host = Host,
-                get_password = GetPassword,
-                check_password = CheckPasswordDigest}}.
+                creds = Creds}}.
 
--spec mech_step(State :: tuple(),
-                ClientIn :: any()
-                ) -> {ok, proplists:proplist()} | {error, binary()}.
+-spec mech_step(State :: tuple(), ClientIn :: any()) -> R when
+      R :: {ok, mongoose_credentials:t()}
+         | cyrsasl:error().
 mech_step(#state{step = 1, nonce = Nonce} = State, _) ->
     {continue,
      list_to_binary("nonce=\"" ++ Nonce ++
@@ -86,15 +81,21 @@ mech_step(#state{step = 3, nonce = Nonce} = State, ClientIn) ->
                     {error, <<"not-authorized">>, UserName};
                 true ->
                     AuthzId = xml:get_attr_s(<<"authzid">>, KeyVals),
-                    case (State#state.get_password)(UserName) of
+                    LServer = mongoose_credentials:lserver(State#state.creds),
+                    case ejabberd_auth:get_password_with_authmodule(UserName, LServer) of
                         {false, _} ->
                             {error, <<"not-authorized">>, UserName};
                         {Passwd, AuthModule} ->
-                                case (State#state.check_password)(UserName, <<>>,
-                                        xml:get_attr_s(<<"response">>, KeyVals),
-                                        fun(PW) -> response(KeyVals, UserName, PW, Nonce, AuthzId,
-                                                <<"AUTHENTICATE">>) end) of
-                                {true, _} ->
+                            DigestGen = fun(PW) -> response(KeyVals, UserName, PW, Nonce, AuthzId,
+                                                            <<"AUTHENTICATE">>)
+                                        end,
+                            Request = mongoose_credentials:extend(State#state.creds,
+                                                                  [{username, UserName},
+                                                                   {password, <<>>},
+                                                                   {digest, xml:get_attr_s(<<"response">>, KeyVals)},
+                                                                   {digest_gen, DigestGen}]),
+                            case ejabberd_auth:authorize(Request) of
+                                {ok, Result} ->
                                     RspAuth = response(KeyVals,
                                                        UserName, Passwd,
                                                        Nonce, AuthzId, <<>>),
@@ -103,11 +104,13 @@ mech_step(#state{step = 3, nonce = Nonce} = State, ClientIn) ->
                                      State#state{step = 5,
                                                  auth_module = AuthModule,
                                                  username = UserName,
-                                                 authzid = AuthzId}};
-                                false ->
+                                                 authzid = AuthzId,
+                                                 creds = Result}};
+                                {error, not_authorized} ->
                                     {error, <<"not-authorized">>, UserName};
-                                {false, _} ->
-                                    {error, <<"not-authorized">>, UserName}
+                                {error, R} ->
+                                    ?DEBUG("authorize error: ~p", [R]),
+                                    {error, <<"not-authorized">>}
                             end
                     end
             end
@@ -115,15 +118,17 @@ mech_step(#state{step = 3, nonce = Nonce} = State, ClientIn) ->
 mech_step(#state{step = 5,
                  auth_module = AuthModule,
                  username = UserName,
-                 authzid = AuthzId}, <<>>) ->
-    {ok, [{username, UserName}, {authzid, AuthzId},
-          {auth_module, AuthModule}]};
+                 authzid = AuthzId,
+                 creds = Creds}, <<>>) ->
+    {ok, mongoose_credentials:extend(Creds, [{username, UserName},
+                                             {authzid, AuthzId},
+                                             {auth_module, AuthModule}])};
 mech_step(A, B) ->
-    ?DEBUG("SASL DIGEST: A ~p B ~p", [A,B]),
+    ?DEBUG("SASL DIGEST: A ~p B ~p", [A, B]),
     {error, <<"bad-protocol">>}.
 
 
--spec parse(binary()) -> 'bad' | [{binary(),binary()}].
+-spec parse(binary()) -> 'bad' | [{binary(), binary()}].
 parse(S) ->
     parse1(S, <<>>, []).
 
@@ -159,8 +164,8 @@ parse3(<<>>, _, _, _) ->
 -spec parse4(binary(),
     Key :: binary(),
     Val :: binary(),
-    Ts :: [{binary(),binary()}]) -> 'bad' | [{K :: binary(), V :: binary()}].
-parse4(<<$, , Cs/binary>>, Key, Val, Ts) ->
+    Ts :: [{binary(), binary()}]) -> 'bad' | [{K :: binary(), V :: binary()}].
+parse4(<<$,, Cs/binary>>, Key, Val, Ts) ->
     parse1(Cs, <<>>, [{Key, binary_reverse(Val)} | Ts]);
 parse4(<<$\s, Cs/binary>>, Key, Val, Ts) ->
     parse4(Cs, Key, Val, Ts);
@@ -171,8 +176,8 @@ parse4(<<>>, Key, Val, Ts) ->
 
 binary_reverse(<<>>) ->
     <<>>;
-binary_reverse(<<H,T/binary>>) ->
-    <<(binary_reverse(T))/binary,H>>.
+binary_reverse(<<H, T/binary>>) ->
+    <<(binary_reverse(T))/binary, H>>.
 
 %% @doc Check if the digest-uri is valid.
 %% RFC-2831 allows to provide the IP address in Host,
@@ -205,7 +210,7 @@ digit_to_xchar(D) ->
 hex(S) ->
     hex(S, <<>>).
 
--spec hex(binary(),binary()) -> binary().
+-spec hex(binary(), binary()) -> binary().
 hex(<<>>, Res) ->
     binary_reverse(Res);
 hex(<<N, Ns/binary>>, Res) ->
@@ -214,7 +219,7 @@ hex(<<N, Ns/binary>>, Res) ->
     hex(Ns, <<D1, D2, Res/binary>>).
 
 
--spec response(KeyVals :: [{binary(),binary()}],
+-spec response(KeyVals :: [{binary(), binary()}],
                User :: ejabberd:user(),
                Passwd :: binary(),
                Nonce :: binary(),
@@ -227,26 +232,23 @@ response(KeyVals, User, Passwd, Nonce, AuthzId, A2Prefix) ->
     NC = xml:get_attr_s(<<"nc">>, KeyVals),
     QOP = xml:get_attr_s(<<"qop">>, KeyVals),
     A1 = case AuthzId of
-	     <<>> ->
-		 list_to_binary(
-		   [crypto:hash(md5, [User, <<":">>, Realm, <<":">>, Passwd]),
-		     <<":">>, Nonce, <<":">>, CNonce]);
-	     _ ->
-		 list_to_binary(
-		   [crypto:hash(md5, [User, <<":">>, Realm, <<":">>, Passwd]),
-		     <<":">>, Nonce, <<":">>, CNonce, <<":">>, AuthzId])
-	 end,
+             <<>> ->
+                 list_to_binary(
+                   [crypto:hash(md5, [User, <<":">>, Realm, <<":">>, Passwd]),
+                     <<":">>, Nonce, <<":">>, CNonce]);
+             _ ->
+                 list_to_binary(
+                   [crypto:hash(md5, [User, <<":">>, Realm, <<":">>, Passwd]),
+                     <<":">>, Nonce, <<":">>, CNonce, <<":">>, AuthzId])
+         end,
     A2 = case QOP of
-	     <<"auth">> ->
-		 [A2Prefix, <<":">>, DigestURI];
-	     _ ->
-		 [A2Prefix, <<":">>, DigestURI,
-		     <<":00000000000000000000000000000000">>]
-	 end,
+             <<"auth">> ->
+                 [A2Prefix, <<":">>, DigestURI];
+             _ ->
+                 [A2Prefix, <<":">>, DigestURI,
+                     <<":00000000000000000000000000000000">>]
+         end,
     T = [hex(crypto:hash(md5, A1)), <<":">>, Nonce, <<":">>,
-	NC, <<":">>, CNonce, <<":">>, QOP, <<":">>,
-	hex(crypto:hash(md5, A2))],
+        NC, <<":">>, CNonce, <<":">>, QOP, <<":">>,
+        hex(crypto:hash(md5, A2))],
     hex(crypto:hash(md5, T)).
-
-
-

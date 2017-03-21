@@ -31,9 +31,8 @@
 -behaviour(ejabberd_gen_auth).
 -export([start/1,
          stop/1,
+         authorize/1,
          set_password/3,
-         check_password/3,
-         check_password/5,
          try_register/3,
          dirty_get_registered_users/0,
          get_vh_registered_users/1,
@@ -42,14 +41,15 @@
          get_vh_registered_users_number/2,
          get_password/2,
          get_password_s/2,
-         is_user_exists/2,
+         does_user_exist/2,
          remove_user/2,
          remove_user/3,
-         store_type/1,
-         plain_password_required/0
+         store_type/1
         ]).
 
--export([login/2, get_password/3]).
+%% Internal
+-export([check_password/3,
+         check_password/5]).
 
 -export([scram_passwords/2, scram_passwords/4]).
 
@@ -68,80 +68,69 @@ start(_Host) ->
 stop(_Host) ->
     ok.
 
-plain_password_required() ->
-    false.
-
 store_type(Server) ->
     case scram:enabled(Server) of
         false -> plain;
         true -> scram
     end.
 
--spec check_password(User :: ejabberd:user(),
-                     Server :: ejabberd:server(),
+-spec authorize(mongoose_credentials:t()) -> {ok, mongoose_credentials:t()}
+                                           | {error, any()}.
+authorize(Creds) ->
+    ejabberd_auth:authorize_with_check_password(?MODULE, Creds).
+
+-spec check_password(LUser :: ejabberd:luser(),
+                     LServer :: ejabberd:lserver(),
                      Password :: binary()) -> boolean().
-check_password(User, Server, Password) ->
-    case jlib:nodeprep(User) of
-	error ->
-	    false;
-	LUser ->
-	    Username = ejabberd_odbc:escape(LUser),
-	    LServer = jlib:nameprep(Server),
-	    check_password_wo_escape(Username, LServer, Password)
-    end.
+check_password(LUser, LServer, Password) ->
+    Username = mongoose_rdbms:escape(LUser),
+    true == check_password_wo_escape(Username, LServer, Password).
 
 
--spec check_password(User :: ejabberd:user(),
-                     Server :: ejabberd:server(),
+-spec check_password(LUser :: ejabberd:luser(),
+                     LServer :: ejabberd:lserver(),
                      Password :: binary(),
                      Digest :: binary(),
                      DigestGen :: fun()) -> boolean().
-check_password(User, Server, Password, Digest, DigestGen) ->
-    case jlib:nodeprep(User) of
-        error ->
-            false;
-        LUser ->
-            Username = ejabberd_odbc:escape(LUser),
-            LServer = jlib:nameprep(Server),
-            try odbc_queries:get_password(LServer, Username) of
-                %% Account exists, check if password is valid
-                {selected, [<<"password">>, <<"pass_details">>], [{Passwd, null}]} ->
-                    ejabberd_auth:check_digest(Digest, DigestGen, Password, Passwd);
-                {selected, [<<"password">>, <<"pass_details">>], [{_Passwd, PassDetails}]} ->
-                    case scram:deserialize(PassDetails) of
-                        #scram{storedkey = StoredKey} ->
-                            Passwd = base64:decode(StoredKey),
-                            ejabberd_auth:check_digest(Digest, DigestGen, Password, Passwd);
-                        _ ->
-                            false
-                    end;
-                {selected, [<<"password">>, <<"pass_details">>], []} ->
-                    false; %% Account does not exist
-                {error, _Error} ->
-                    false %% Typical error is that table doesn't exist
-            catch
-                _:_ ->
-                    false %% Typical error is database not accessible
-            end
+check_password(LUser, LServer, Password, Digest, DigestGen) ->
+    Username = mongoose_rdbms:escape(LUser),
+    try rdbms_queries:get_password(LServer, Username) of
+        %% Account exists, check if password is valid
+        {selected, [{Passwd, null}]} ->
+            ejabberd_auth:check_digest(Digest, DigestGen, Password, Passwd);
+        {selected, [{_Passwd, PassDetails}]} ->
+            case scram:deserialize(PassDetails) of
+                {ok, #scram{} = Scram} ->
+                    scram:check_digest(Scram, Digest, DigestGen, Password);
+                _ ->
+                    false
+            end;
+        {selected, []} ->
+            false; %% Account does not exist
+        {error, _Error} ->
+            false %% Typical error is that table doesn't exist
+    catch
+        _:_ ->
+            false %% Typical error is database not accessible
     end.
 
--spec check_password_wo_escape(User::ejabberd:user(),
-                               Server::ejabberd:server(),
+-spec check_password_wo_escape(LUser::ejabberd:luser(),
+                               LServer::ejabberd:lserver(),
                                Password::binary()) -> boolean() | not_exists.
-check_password_wo_escape(User, Server, Password) ->
-    try odbc_queries:get_password(Server, User) of
-        {selected, [<<"password">>, <<"pass_details">>], [{Password, null}]} ->
+check_password_wo_escape(LUser, LServer, Password) ->
+    try rdbms_queries:get_password(LServer, LUser) of
+        {selected, [{Password, null}]} ->
             Password /= <<"">>; %% Password is correct, and not empty
-        {selected, [<<"password">>, <<"pass_details">>], [{_Password2, null}]} ->
+        {selected, [{_Password2, null}]} ->
             false;
-        {selected, [<<"password">>, <<"pass_details">>], [{_Password2, PassDetails}]} ->
+        {selected, [{_Password2, PassDetails}]} ->
             case scram:deserialize(PassDetails) of
                 {ok, Scram} ->
                     scram:check_password(Password, Scram);
                 _ ->
                     false %% Password is not correct
             end;
-        {selected, [<<"password">>, <<"pass_details">>], []} ->
+        {selected, []} ->
             not_exists; %% Account does not exist
         {error, _Error} ->
             false %% Typical error is that table doesn't exist
@@ -151,58 +140,36 @@ check_password_wo_escape(User, Server, Password) ->
     end.
 
 
--spec set_password(User :: ejabberd:user(),
-                   Server :: ejabberd:server(),
+-spec set_password(LUser :: ejabberd:luser(),
+                   LServer :: ejabberd:lserver(),
                    Password :: binary()
-                   ) -> ok | {error, not_allowed | invalid_jid}.
-set_password(User, Server, Password) ->
-    case jlib:nodeprep(User) of
-        error ->
-            {error, invalid_jid};
-        LUser ->
-            Username = ejabberd_odbc:escape(LUser),
-            LServer = jlib:nameprep(Server),
-            case prepare_password(Server, Password) of
-                false ->
-                    {error, invalid_password};
-                Pass ->
-                    case catch odbc_queries:set_password_t(LServer, Username, Pass) of
-                        {atomic, ok} ->
-                            ok;
-                        Other ->
-                            {error, Other}
-                    end
-            end
+                   ) -> ok | {error, not_allowed}.
+set_password(LUser, LServer, Password) ->
+    Username = mongoose_rdbms:escape(LUser),
+    PreparedPass = prepare_password(LServer, Password),
+    case catch rdbms_queries:set_password_t(LServer, Username, PreparedPass) of
+        {atomic, ok} ->
+            ok;
+        Error ->
+            ?WARNING_MSG("Failed SQL request: ~p", [Error]),
+            {error, not_allowed}
     end.
 
-
--spec try_register(User :: ejabberd:user(),
-                   Server :: ejabberd:server(),
+-spec try_register(LUser :: ejabberd:luser(),
+                   LServer :: ejabberd:lserver(),
                    Password :: binary()
-                   ) -> {atomic, ok | exists}
-                      | {error, invalid_jid | not_allowed} | {aborted, _}.
-try_register(User, Server, Password) ->
-    case jlib:nodeprep(User) of
-        error ->
-            {error, invalid_jid};
-        LUser ->
-            Username = ejabberd_odbc:escape(LUser),
-            case prepare_password(Server, Password) of
-                false ->
-                    {error, invalid_password};
-                Pass ->
-                    LServer = jlib:nameprep(Server),
-                    case catch odbc_queries:add_user(LServer, Username, Pass) of
-                        {updated, 1} ->
-                            {atomic, ok};
-                        _ ->
-                            {atomic, exists}
-                    end
-            end
+                   ) -> ok | {error, exists}.
+try_register(LUser, LServer, Password) ->
+    Username = mongoose_rdbms:escape(LUser),
+    PreparedPass = prepare_password(LServer, Password),
+    case catch rdbms_queries:add_user(LServer, Username, PreparedPass) of
+        {updated, 1} ->
+            ok;
+        _ ->
+            {error, exists}
     end.
 
-
--spec dirty_get_registered_users() -> [ejabberd:simple_jid()].
+-spec dirty_get_registered_users() -> [ejabberd:simple_bare_jid()].
 dirty_get_registered_users() ->
     Servers = ejabberd_config:get_vh_by_auth_method(odbc),
     lists:flatmap(
@@ -211,193 +178,163 @@ dirty_get_registered_users() ->
       end, Servers).
 
 
--spec get_vh_registered_users(Server :: ejabberd:server()
-                             ) -> [ejabberd:simple_jid()].
-get_vh_registered_users(Server) ->
-    LServer = jlib:nameprep(Server),
-    case catch odbc_queries:list_users(LServer) of
-        {selected, [<<"username">>], Res} ->
+-spec get_vh_registered_users(LServer :: ejabberd:lserver()) -> [ejabberd:simple_bare_jid()].
+get_vh_registered_users(LServer) ->
+    case catch rdbms_queries:list_users(LServer) of
+        {selected, Res} ->
             [{U, LServer} || {U} <- Res];
         _ ->
             []
     end.
 
 
--spec get_vh_registered_users(Server :: ejabberd:server(), Opts :: list()
-                             ) -> [ejabberd:simple_jid()].
-get_vh_registered_users(Server, Opts) ->
-    LServer = jlib:nameprep(Server),
-    case catch odbc_queries:list_users(LServer, Opts) of
-        {selected, [<<"username">>], Res} ->
+-spec get_vh_registered_users(LServer :: ejabberd:lserver(), Opts :: list()
+                             ) -> [ejabberd:simple_bare_jid()].
+get_vh_registered_users(LServer, Opts) ->
+    case catch rdbms_queries:list_users(LServer, Opts) of
+        {selected, Res} ->
             [{U, LServer} || {U} <- Res];
         _ ->
             []
     end.
 
 
--spec get_vh_registered_users_number(Server :: ejabberd:server()
+-spec get_vh_registered_users_number(LServer :: ejabberd:lserver()
                                     ) -> integer().
-get_vh_registered_users_number(Server) ->
-    LServer = jlib:nameprep(Server),
-    case catch odbc_queries:users_number(LServer) of
-        {selected, [_], [{Res}]} ->
-            list_to_integer(binary_to_list(Res));
+get_vh_registered_users_number(LServer) ->
+    case catch rdbms_queries:users_number(LServer) of
+        {selected, [{Res}]} when is_integer(Res) ->
+            Res;
+        {selected, [{Res}]} ->
+            mongoose_rdbms:result_to_integer(Res);
         _ ->
             0
     end.
 
 
--spec get_vh_registered_users_number(Server :: ejabberd:server(),
+-spec get_vh_registered_users_number(LServer :: ejabberd:lserver(),
                                      Opts :: list()) -> integer().
-get_vh_registered_users_number(Server, Opts) ->
-    LServer = jlib:nameprep(Server),
-    case catch odbc_queries:users_number(LServer, Opts) of
-        {selected, [_], [{Res}]} ->
+get_vh_registered_users_number(LServer, Opts) ->
+    case catch rdbms_queries:users_number(LServer, Opts) of
+        {selected, [{Res}]} ->
             list_to_integer(Res);
         _Other ->
             0
     end.
 
 
--spec get_password(User :: ejabberd:user(),
-                   Server :: ejabberd:server()) -> binary() | false.
-get_password(User, Server) ->
-    case jlib:nodeprep(User) of
-        error ->
-            false;
-        LUser ->
-            Username = ejabberd_odbc:escape(LUser),
-            LServer = jlib:nameprep(Server),
-            case catch odbc_queries:get_password(LServer, Username) of
-                {selected, [<<"password">>, <<"pass_details">>], [{Password, null}]} ->
-                    Password; %%Plain password
-                {selected, [<<"password">>, <<"pass_details">>], [{_Password, PassDetails}]} ->
-                    case scram:deserialize(PassDetails) of
-                        {ok, Scram} ->
-                            {base64:decode(Scram#scram.storedkey),
-                             base64:decode(Scram#scram.serverkey),
-                             base64:decode(Scram#scram.salt),
-                             Scram#scram.iterationcount};
-                        _ ->
-                            false
-                    end;
+-spec get_password(ejabberd:luser(), ejabberd:lserver()) -> ejabberd_auth:passwordlike() | false.
+get_password(LUser, LServer) ->
+    Username = mongoose_rdbms:escape(LUser),
+    case catch rdbms_queries:get_password(LServer, Username) of
+        {selected, [{Password, null}]} ->
+            Password; %%Plain password
+        {selected, [{_Password, PassDetails}]} ->
+            case scram:deserialize(PassDetails) of
+                {ok, Scram} ->
+                    scram:scram_to_tuple(Scram);
                 _ ->
                     false
-            end
+            end;
+        _ ->
+            false
     end.
 
 
--spec get_password_s(User :: ejabberd:user(),
-                     Server :: ejabberd:server()) -> binary().
-get_password_s(User, Server) ->
-    case jlib:nodeprep(User) of
-        error ->
-            <<"">>;
-        LUser ->
-            Username = ejabberd_odbc:escape(LUser),
-            LServer = jlib:nameprep(Server),
-            case catch odbc_queries:get_password(LServer, Username) of
-                {selected, [<<"password">>, <<"pass_details">>], [{Password, _}]} ->
-                    Password;
-                _ ->
-                    <<"">>
-            end
+-spec get_password_s(LUser :: ejabberd:user(),
+                     LServer :: ejabberd:server()) -> binary().
+get_password_s(LUser, LServer) ->
+    Username = mongoose_rdbms:escape(LUser),
+    case catch rdbms_queries:get_password(LServer, Username) of
+        {selected, [{Password, _}]} ->
+            Password;
+        _ ->
+            <<"">>
     end.
 
 
--spec is_user_exists(User :: ejabberd:user(),
-                     Server :: ejabberd:server()
+-spec does_user_exist(LUser :: ejabberd:luser(),
+                     LServer :: ejabberd:lserver()
                     ) -> boolean() | {error, atom()}.
-is_user_exists(User, Server) ->
-    case jlib:nodeprep(User) of
-        error ->
-            false;
-        LUser ->
-            Username = ejabberd_odbc:escape(LUser),
-            LServer = jlib:nameprep(Server),
-            try odbc_queries:get_password(LServer, Username) of
-                {selected, [<<"password">>, <<"pass_details">>], [{_Password, _}]} ->
-                    true; %% Account exists
-                {selected, [<<"password">>, <<"pass_details">>], []} ->
-                    false; %% Account does not exist
-                {error, Error} ->
-                    {error, Error} %% Typical error is that table doesn't exist
-            catch
-                _:B ->
-                    {error, B} %% Typical error is database not accessible
-            end
+does_user_exist(LUser, LServer) ->
+    Username = mongoose_rdbms:escape(LUser),
+    try rdbms_queries:get_password(LServer, Username) of
+        {selected, [{_Password, _}]} ->
+            true; %% Account exists
+        {selected, []} ->
+            false; %% Account does not exist
+        {error, Error} ->
+            {error, Error} %% Typical error is that table doesn't exist
+    catch
+        _:B ->
+            {error, B} %% Typical error is database not accessible
     end.
 
 
 %% @doc Remove user.
 %% Note: it may return ok even if there was some problem removing the user.
--spec remove_user(User :: ejabberd:user(),
-                  Server :: ejabberd:server()
-                  ) -> ok | error | {error, not_allowed}.
-remove_user(User, Server) ->
-    case jlib:nodeprep(User) of
-        error ->
-            error;
-        LUser ->
-            Username = ejabberd_odbc:escape(LUser),
-            LServer = jlib:nameprep(Server),
-            catch odbc_queries:del_user(LServer, Username),
-            ok
-    end.
+-spec remove_user(LUser :: ejabberd:luser(),
+                  LServer :: ejabberd:lserver()
+                  ) -> ok.
+remove_user(LUser, LServer) ->
+    Username = mongoose_rdbms:escape(LUser),
+    catch rdbms_queries:del_user(LServer, Username),
+    ok.
 
 
 %% @doc Remove user if the provided password is correct.
--spec remove_user(User :: ejabberd:user(),
-                  Server :: ejabberd:server(),
+-spec remove_user(LUser :: ejabberd:luser(),
+                  LServer :: ejabberd:lserver(),
                   Password :: binary()
-                 ) -> ok | not_exists | not_allowed | bad_request | error.
-remove_user(User, Server, Password) ->
-    case jlib:nodeprep(User) of
-        error ->
-            error;
-        LUser ->
-            Username = ejabberd_odbc:escape(LUser),
-            Pass = ejabberd_odbc:escape(Password),
-            LServer = jlib:nameprep(Server),
-            case check_password_wo_escape(Username, LServer, Pass) of
-                true ->
-                    case catch odbc_queries:del_user(LServer, Username) of
-                        {'EXIT', _} -> error;
-                        _ -> ok
-                    end;
-                not_exists ->
-                    not_exists;
-                false ->
-                    not_allowed
-            end
+                 ) -> ok | {error, not_exists | not_allowed}.
+remove_user(LUser, LServer, Password) ->
+    Username = mongoose_rdbms:escape(LUser),
+    Pass = mongoose_rdbms:escape(Password),
+    case check_password_wo_escape(Username, LServer, Pass) of
+        true ->
+            case catch rdbms_queries:del_user(LServer, Username) of
+                {'EXIT', Error} ->
+                    ?WARNING_MSG("Failed SQL query: ~p", [Error]),
+                    {error, not_allowed};
+                _ ->
+                    ok
+            end;
+        not_exists ->
+            {error, not_exists};
+        false ->
+            {error, not_allowed}
     end.
 
 %%%------------------------------------------------------------------
 %%% SCRAM
 %%%------------------------------------------------------------------
 
-prepare_password(Iterations, Password) when is_integer(Iterations) ->
+-spec prepare_scrammed_password(Iterations :: pos_integer(), Password :: binary()) ->
+    {PreparedPassword :: binary(), ExtendedPassword :: binary()}.
+prepare_scrammed_password(Iterations, Password) when is_integer(Iterations) ->
     Scram = scram:password_to_scram(Password, Iterations),
     PassDetails = scram:serialize(Scram),
-    PassDetailsEscaped = ejabberd_odbc:escape(PassDetails),
-    {<<"">>, PassDetailsEscaped};
+    PassDetailsEscaped = mongoose_rdbms:escape(PassDetails),
+    {<<>>, PassDetailsEscaped}.
 
+-spec prepare_password(Server :: ejabberd:server(), Password :: binary()) ->
+    PreparedPassword :: {binary(), binary()} | binary().
 prepare_password(Server, Password) ->
     case scram:enabled(Server) of
         true ->
-            prepare_password(scram:iterations(Server), Password);
+            prepare_scrammed_password(scram:iterations(Server), Password);
         _ ->
-            ejabberd_odbc:escape(Password)
+            mongoose_rdbms:escape(Password)
     end.
 
 scram_passwords(Server, ScramIterationCount) ->
     scram_passwords(Server, ?DEFAULT_SCRAMMIFY_COUNT, ?DEFAULT_SCRAMMIFY_INTERVAL, ScramIterationCount).
 
 scram_passwords(Server, Count, Interval, ScramIterationCount) ->
-    LServer = jlib:nameprep(Server),
+    LServer = jid:nameprep(Server),
     ?INFO_MSG("Converting the stored passwords into SCRAM bits", []),
-    ToConvertCount = case catch odbc_queries:get_users_without_scram_count(LServer) of
-        {selected, [_], [{Res}]} -> binary_to_integer(Res);
+    ToConvertCount = case catch rdbms_queries:get_users_without_scram_count(LServer) of
+        {selected, [{Res}]} -> binary_to_integer(Res);
         _ -> 0
     end,
 
@@ -405,15 +342,15 @@ scram_passwords(Server, Count, Interval, ScramIterationCount) ->
     scram_passwords1(LServer, Count, Interval, ScramIterationCount).
 
 scram_passwords1(LServer, Count, Interval, ScramIterationCount) ->
-    case odbc_queries:get_users_without_scram(LServer, Count) of
-        {selected, _, []} ->
+    case rdbms_queries:get_users_without_scram(LServer, Count) of
+        {selected, []} ->
             ?INFO_MSG("All users scrammed.", []);
-        {selected, [<<"username">>, <<"password">>], Results} ->
+        {selected, Results} ->
             ?INFO_MSG("Scramming ~p users...", [length(Results)]),
             lists:foreach(
               fun({Username, Password}) ->
-                      Scrammed = prepare_password(ScramIterationCount, Password),
-                      case catch odbc_queries:set_password_t(LServer, Username, Scrammed) of
+                      Scrammed = prepare_scrammed_password(ScramIterationCount, Password),
+                      case catch rdbms_queries:set_password_t(LServer, Username, Scrammed) of
                           {atomic, ok} -> ok;
                           Other -> ?ERROR_MSG("Could not scrammify user ~s@~s because: ~p", [Username, LServer, Other])
                       end
@@ -424,7 +361,3 @@ scram_passwords1(LServer, Count, Interval, ScramIterationCount) ->
         Other ->
             ?ERROR_MSG("Interrupted scramming because: ~p", [Other])
     end.
-
-%% @doc Unimplemented gen_auth callbacks
-login(_User, _Server) -> erlang:error(not_implemented).
-get_password(_User, _Server, _DefaultValue) -> erlang:error(not_implemented).

@@ -122,11 +122,9 @@ CREATE TABLE privacy_list (
     username varchar(250) NOT NULL,
     name varchar(250) NOT NULL,
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE,
-    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (username(75), name(75))
 ) CHARACTER SET utf8;
-
-CREATE INDEX i_privacy_list_username  USING BTREE ON privacy_list(username);
-CREATE UNIQUE INDEX i_privacy_list_username_name USING BTREE ON privacy_list (username(75), name(75));
 
 CREATE TABLE privacy_list_data (
     id bigint,
@@ -138,7 +136,8 @@ CREATE TABLE privacy_list_data (
     match_iq boolean NOT NULL,
     match_message boolean NOT NULL,
     match_presence_in boolean NOT NULL,
-    match_presence_out boolean NOT NULL
+    match_presence_out boolean NOT NULL,
+    PRIMARY KEY (id, ord)
 ) CHARACTER SET utf8;
 
 CREATE TABLE private_storage (
@@ -161,6 +160,34 @@ CREATE TABLE roster_version (
 -- ALTER TABLE rosterusers ADD COLUMN askmessage text AFTER ask;
 -- UPDATE rosterusers SET askmessage = '';
 -- ALTER TABLE rosterusers ALTER COLUMN askmessage SET NOT NULL;
+--
+-- To update from 2.0.0:
+-- ALTER TABLE mam_message ADD COLUMN search_body text;
+-- ALTER TABLE mam_muc_message ADD COLUMN search_body text;
+--
+-- NOTE: A "minified" JID is an encoded form of JID storing only
+--       the difference between a user's JID and the real JID.
+--       Consult with mod_mam_utils:jid_to_opt_binary/2
+--
+--       How it works. We produce encoded_jid using information from
+--       archive_jid and real_jid:
+--       | archive_jid      | real_jid        | encoded_jid
+--       | ---------------- | --------------- | --------------------
+--       | alice@host       | alice@host      |
+--       | alice@host       | alice@host/r1   | /r1
+--       | alice@host       | bob@host        | bob
+--       | alice@host       | bob@host/r1     | bob/r1
+--       | alice@host       | kate@example    | example:kate
+--       | alice@host       | kate@example/r1 | example@kate/r1
+--
+--
+-- SIMPLE FORMAT
+-- =============
+--
+-- Differences between old and simple format:
+-- - message is stored as XML
+-- - remote_bare_jid is not "minified"
+-- To enable simple format pass {simple, true} as an option for mod_mam_odbc_arch
 CREATE TABLE mam_message(
   -- Message UID (64 bits)
   -- A server-assigned UID that MUST be unique within the archive.
@@ -168,9 +195,11 @@ CREATE TABLE mam_message(
   user_id INT UNSIGNED NOT NULL,
   -- FromJID used to form a message without looking into stanza.
   -- This value will be send to the client "as is".
+  -- This JID is "minified".
   from_jid varchar(250) CHARACTER SET binary NOT NULL,
   -- The remote JID that the stanza is to (for an outgoing message) or from (for an incoming message).
   -- This field is for sorting and filtering.
+  -- This JID is "minified".
   remote_bare_jid varchar(250) CHARACTER SET binary NOT NULL,
   remote_resource varchar(250) CHARACTER SET binary NOT NULL,
   -- I - incoming, remote_jid is a value from From.
@@ -178,16 +207,18 @@ CREATE TABLE mam_message(
   -- Has no meaning for MUC-rooms.
   direction ENUM('I','O') NOT NULL,
   -- Term-encoded message packet
+  -- Don't try to decode it using MySQL tools
   message blob NOT NULL,
+  search_body text,
   PRIMARY KEY (user_id, id),
-  INDEX i_mam_message_rem USING BTREE (user_id, remote_bare_jid, id),
-  INDEX i_mam_message_uid USING BTREE (user_id, id)
+  INDEX i_mam_message_rem USING BTREE (user_id, remote_bare_jid, id)
 )  ENGINE=InnoDB
    PARTITION BY HASH(user_id)
    PARTITIONS 32;
 -- Partition is selected based on MOD(user_id, 32)
 -- See for more information
 -- http://dev.mysql.com/doc/refman/5.1/en/partitioning-hash.html
+
 
 CREATE TABLE mam_config(
   user_id INT UNSIGNED NOT NULL,
@@ -196,40 +227,30 @@ CREATE TABLE mam_config(
   -- A - always archive;
   -- N - never archive;
   -- R - roster (only for remote_jid == "")
-  behaviour ENUM('A', 'N', 'R') NOT NULL
+  behaviour ENUM('A', 'N', 'R') NOT NULL,
+  PRIMARY KEY (user_id, remote_jid)
 );
-CREATE INDEX i_mam_config USING HASH ON mam_config(user_id, remote_jid);
-
-CREATE TABLE mam_user(
-  id INT UNSIGNED NOT NULL AUTO_INCREMENT,
-  user_name varchar(250) CHARACTER SET binary NOT NULL,
-  PRIMARY KEY(id) USING HASH,
-  CONSTRAINT uc_mam_user_name UNIQUE (user_name)
-);
-CREATE INDEX i_mam_user_name USING HASH ON mam_user(user_name);
 
 CREATE TABLE mam_server_user(
   id INT UNSIGNED NOT NULL AUTO_INCREMENT,
   server    varchar(250) CHARACTER SET binary NOT NULL,
   user_name varchar(250) CHARACTER SET binary NOT NULL,
   PRIMARY KEY(id) USING HASH,
-  CONSTRAINT uc_mam_server_user_name UNIQUE (server, user_name)
+  CONSTRAINT uc_mam_server_user_name UNIQUE USING HASH (server, user_name)
 );
-CREATE INDEX i_mam_server_user_name USING HASH ON mam_server_user(server, user_name);
-
 
 CREATE TABLE mam_muc_message(
   -- Message UID
   -- A server-assigned UID that MUST be unique within the archive.
-  id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+  id BIGINT UNSIGNED NOT NULL,
   room_id INT UNSIGNED NOT NULL,
   -- A nick of the message's originator
   nick_name varchar(250) NOT NULL,
   -- Term-encoded message packet
-  message blob NOT NULL
+  message blob NOT NULL,
+  search_body text,
+  PRIMARY KEY (room_id, id)
 );
-CREATE INDEX i_mam_muc_message_room_name_added_at USING BTREE ON mam_muc_message(room_id, id);
-
 
 CREATE TABLE offline_message(
   id BIGINT UNSIGNED        NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -241,3 +262,42 @@ CREATE TABLE offline_message(
   packet    blob            NOT NULL
 );
 CREATE INDEX i_offline_message USING BTREE ON offline_message(server, username, id);
+
+CREATE TABLE muc_light_rooms(
+    id BIGINT UNSIGNED      NOT NULL AUTO_INCREMENT,
+    luser VARCHAR(250)      NOT NULL,
+    lserver VARCHAR(250)    NOT NULL,
+    version VARCHAR(20)     NOT NULL,
+    PRIMARY KEY (lserver, luser),
+    UNIQUE KEY k_id USING HASH (id)
+);
+
+CREATE INDEX i_muc_light_rooms USING HASH ON muc_light_rooms(id);
+
+CREATE TABLE muc_light_occupants(
+    room_id BIGINT UNSIGNED NOT NULL REFERENCES muc_light_rooms(id),
+    luser VARCHAR(250)      NOT NULL,
+    lserver VARCHAR(250)    NOT NULL,
+    aff TINYINT UNSIGNED    NOT NULL
+);
+
+CREATE INDEX i_muc_light_occupants_id USING HASH ON muc_light_occupants(room_id);
+CREATE INDEX i_muc_light_occupants_us USING HASH ON muc_light_occupants(lserver, luser);
+
+CREATE TABLE muc_light_config(
+    room_id BIGINT UNSIGNED NOT NULL REFERENCES muc_light_rooms(id),
+    opt VARCHAR(100)        NOT NULL,
+    val VARCHAR(250)        NOT NULL
+);
+
+CREATE INDEX i_muc_light_config USING HASH ON muc_light_config(room_id);
+
+CREATE TABLE muc_light_blocking(
+    luser VARCHAR(250)      NOT NULL,
+    lserver VARCHAR(250)    NOT NULL,
+    what TINYINT UNSIGNED   NOT NULL,
+    who VARCHAR(500)        NOT NULL
+);
+
+CREATE INDEX i_muc_light_blocking USING HASH ON muc_light_blocking(luser, lserver);
+

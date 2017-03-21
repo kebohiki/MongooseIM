@@ -21,9 +21,6 @@
 
 -define(MAX_USERS_DEFAULT, 200).
 
--define(SETS, gb_sets).
--define(DICT, dict).
-
 -record(lqueue, {queue,
                  len :: non_neg_integer(),
                  max :: non_neg_integer()
@@ -47,7 +44,8 @@
                  password_protected = false     :: boolean(),
                  password = <<>>,
                  anonymous = true               :: boolean(),
-                 max_users = ?MAX_USERS_DEFAULT,
+                 max_users = ?MAX_USERS_DEFAULT :: pos_integer() | none,
+                 maygetmemberlist = [],
                  logging = false                :: boolean()
                 }).
 
@@ -75,20 +73,31 @@
                 access              :: mod_muc:access(),
                 jid                 :: ejabberd:jid(),
                 config = #config{}  :: mod_muc_room:config(),
-                users = ?DICT:new(),
-                sessions = ?DICT:new(),
-                robots = ?DICT:new(),
-                affiliations = ?DICT:new(),
+                users = dict:new(),
+                sessions = dict:new(),
+                robots = dict:new(),
+                affiliations = dict:new(),
                 history,
                 subject = <<>>,
                 subject_author = <<>>,
                 just_created = false     :: boolean(),
                 activity = treap:empty() :: treap:treap(),
                 room_shaper              :: shaper:shaper(),
-                room_queue = queue:new()
+                room_queue = queue:new(),
+                http_auth_pool = none :: none | mongoose_http_client:pool(),
+                http_auth_pids = [] :: [pid()],
+                hibernate_timeout = 90000 :: timeout()
                }).
 
--record(muc_online_users, {us :: ejabberd:simple_bare_jid(),
-                           room :: mod_muc:room(),
-                           host :: ejabberd:server()
-                          }).
+-record(muc_online_users, {
+          us,
+          room,
+          host
+         }).
+
+-type muc_online_users() :: #muc_online_users{
+        us :: ejabberd:simple_bare_jid(),
+        room :: mod_muc:room(),
+        host :: ejabberd:server()
+       }.
+

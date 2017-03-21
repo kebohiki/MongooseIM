@@ -1,5 +1,5 @@
 -module(mod_stream_management).
-
+-xep([{xep, 198}, {version, "1.3"}]).
 -behaviour(gen_mod).
 
 %% `gen_mod' callbacks
@@ -8,7 +8,8 @@
 
 %% `ejabberd_hooks' handlers
 -export([add_sm_feature/2,
-         remove_smid/3]).
+         remove_smid/5,
+         session_cleanup/5]).
 
 %% `ejabberd.cfg' options (don't use outside of tests)
 -export([get_buffer_max/1,
@@ -33,10 +34,9 @@
 
 start(Host, _Opts) ->
     ?INFO_MSG("mod_stream_management starting", []),
-    ejabberd_hooks:add(c2s_stream_features,
-                       Host, ?MODULE, add_sm_feature, 50),
-    ejabberd_hooks:add(sm_remove_connection_hook,
-                       Host, ?MODULE, remove_smid, 50),
+    ejabberd_hooks:add(c2s_stream_features, Host, ?MODULE, add_sm_feature, 50),
+    ejabberd_hooks:add(sm_remove_connection_hook, Host, ?MODULE, remove_smid, 50),
+    ejabberd_hooks:add(session_cleanup, Host, ?MODULE, session_cleanup, 50),
     mnesia:create_table(sm_session, [{ram_copies, [node()]},
                                      {attributes, record_info(fields, sm_session)}]),
     mnesia:add_table_index(sm_session, sid),
@@ -44,10 +44,9 @@ start(Host, _Opts) ->
 
 stop(Host) ->
     ?INFO_MSG("mod_stream_management stopping", []),
-    ejabberd_hooks:delete(sm_remove_connection_hook,
-                          Host, ?MODULE, remove_smid, 50),
-    ejabberd_hooks:delete(c2s_stream_features,
-                          Host, ?MODULE, add_sm_feature, 50).
+    ejabberd_hooks:delete(sm_remove_connection_hook, Host, ?MODULE, remove_smid, 50),
+    ejabberd_hooks:delete(c2s_stream_features, Host, ?MODULE, add_sm_feature, 50),
+    ejabberd_hooks:delete(session_cleanup, Host, ?MODULE, session_cleanup, 50).
 
 %%
 %% `ejabberd_hooks' handlers
@@ -60,13 +59,19 @@ sm() ->
     #xmlel{name = <<"sm">>,
            attrs = [{<<"xmlns">>, ?NS_STREAM_MGNT_3}]}.
 
-remove_smid(SID, _JID, _Info) ->
+remove_smid(Acc, SID, _JID, _Info, _Reason) ->
     case mnesia:dirty_index_read(sm_session, SID, #sm_session.sid) of
         [] ->
             ok;
         [#sm_session{} = SMSession] ->
             mnesia:sync_dirty(fun mnesia:delete_object/1, [SMSession])
-    end.
+    end,
+    Acc.
+
+-spec session_cleanup(Acc :: map(), LUser :: ejabberd:luser(), LServer :: ejabberd:lserver(),
+                      LResource :: ejabberd:lresource(), SID :: ejabberd_sm:sid()) -> any().
+session_cleanup(Acc, _LUser, _LServer, _LResource, SID) ->
+    remove_smid(Acc, SID, undefined, undefined, undefined).
 
 %%
 %% `ejabberd.cfg' options (don't use outside of tests)
@@ -106,7 +111,7 @@ set_ack_freq(Freq) when is_integer(Freq), Freq > 0 ->
 get_resume_timeout(Default) ->
     gen_mod:get_module_opt(?MYNAME, ?MODULE, resume_timeout, Default).
 
--spec set_resume_timeout(pos_integer()) -> ok.
+-spec set_resume_timeout(pos_integer()) -> boolean().
 set_resume_timeout(ResumeTimeout) ->
     set_module_opt(?MYNAME, ?MODULE, resume_timeout, ResumeTimeout).
 

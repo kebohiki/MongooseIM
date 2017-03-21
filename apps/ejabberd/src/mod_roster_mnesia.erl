@@ -1,7 +1,7 @@
 %%%----------------------------------------------------------------------
 %%% File    : mod_roster_mnesia.erl
 %%% Author  : Michał Piotrowski <michal.piotrowski@erlang-solutions.com>
-%%% Purpose : mod_last mnesia backend (XEP-0012)
+%%% Purpose : mod_roster mnesia backend
 %%%
 %%%
 %%% ejabberd, Copyright (C) 2002-2014   ProcessOne
@@ -12,9 +12,11 @@
 
 -include("mod_roster.hrl").
 -include("jlib.hrl").
+-behaviour(mod_roster).
 
 %% API
 -export([init/2,
+         transaction/2,
          read_roster_version/2,
          write_roster_version/4,
          get_roster/2,
@@ -29,7 +31,7 @@
 
 -export([raw_to_record/2]).
 
--spec init(ejabberd:server(), list()) -> no_return().
+-spec init(ejabberd:server(), list()) -> ok.
 init(_Host, _Opts) ->
     mnesia:create_table(roster,
                         [{disc_copies, [node()]},
@@ -38,10 +40,15 @@ init(_Host, _Opts) ->
                         [{disc_copies, [node()]},
                          {attributes, record_info(fields, roster_version)}]),
     mnesia:add_table_index(roster, us),
-    mnesia:add_table_index(roster_version, us).
+    mnesia:add_table_index(roster_version, us),
+    ok.
 
--spec read_roster_version(ejabberd:luser(), ejabberd:lserver())
--> binary() | error.
+-spec transaction(LServer :: ejabberd:lserver(), F :: fun()) ->
+    {aborted, Reason :: any()} | {atomic, Result :: any()}.
+transaction(_LServer, F) ->
+    mnesia:transaction(F).
+
+-spec read_roster_version(ejabberd:luser(), ejabberd:lserver()) -> binary() | error.
 read_roster_version(LUser, LServer) ->
     US = {LUser, LServer},
     case mnesia:dirty_read(roster_version, US) of
@@ -97,7 +104,6 @@ get_roster_by_jid_with_groups_t(LUser, LServer, LJID) ->
 
 remove_user(LUser, LServer) ->
     US = {LUser, LServer},
-    mod_roster:send_unsubscription_to_rosteritems(LUser, LServer),
     F = fun () ->
                 lists:foreach(fun (R) -> mnesia:delete_object(R) end,
                               mnesia:index_read(roster, US, #roster.us))

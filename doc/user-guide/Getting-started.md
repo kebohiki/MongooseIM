@@ -1,38 +1,60 @@
-## Installation 
+## Installation
 
 ### Getting started with MongooseIM on Mac OS X
 
-This short guide will show you how to compile MongooseIM from source code on Mac OS X, and get users chatting right away.
+This short guide will show you how to compile MongooseIM from source code or install binaries from a DMG image on Mac OS X, and get users chatting right away.
 
-#### Before you start
+#### Install from source code
 
-MongooseIM is supported on Mac OS X 10.6.8 and later. Before you can compile and run MongooseIM, you also need the following to be installed on your system: 
+##### Prerequisites for source code installation
 
-* Gnu Make and GCC (the GNU Compiler Collection). To ensure that these are installed, you can install the Command Line Tools for Xcode, available via Xcode or from the Apple Developer website.
+MongooseIM is supported on Mac OS X 10.6.8 and later. Before you can compile and run MongooseIM, you also need the following to be installed on your system:
+
+* GNU Make and GCC (the GNU Compiler Collection). To ensure that these are available, you can install the Command Line Tools for Xcode, available via Xcode or from the Apple Developer website.
 * Git – `brew install git`
-* Erlang /OTP R15B or higher – `brew install erlang`
+* Erlang/OTP 17.5 or higher – `brew install erlang`
 
 An easy way to install some of the packages is by using a package manager, such as [Homebrew](http://brew.sh) – the Homebrew commands are provided here.
 
-#### Installation
+
+##### Build and install from source code
 
 To build and install MongooseIM from source code, do the following:
 
 1. Clone the Git repository:  `git clone https://github.com/esl/MongooseIM.git`
 2. Go to your MongooseIM directory.
-3. Run the following commands: `make` and then `make rel`.
+3. Run the following command: `make rel`.
+
+For more advanced release generation and installation please see [Release/Installation configuration](release_config.md)
+
+
+#### Install from DMG
+
+Go to the [downloads](https://www.erlang-solutions.com/downloads/) page of Erlang Solution website, and download the version of MongooseIM you want.
+Once the DMG is downloaded, double click on it, it will open the content.
+Double click on the .pkg file, it will fire an installation wizard.
+Just follow the instructions.
+
 
 #### Running MongooseIM
 
-* From your MongooseIM directory, go to the release directory:  `cd rel/mongooseim`
+* From your MongooseIM directory, go to the release directory:  `cd _build/prod/rel/mongooseim`
 * To start the MongooseIM server, run the following command:  `bin/mongooseim start`
 * To verify that MongooseIM is running, enter the following:  `bin/mongooseim ping`<br \>If the response is `pong`, then MongooseIM is running.
 * To connect to the MongooseIM console after starting the server:  `bin/mongooseim debug`
 * Alternatively, you can also run the server in interactive mode:  `bin/mongooseim live`
 
+
 #### Registering a user
 
 The default XMPP domain served by MongooseIM right after installation is `localhost`. Users on a different computer can register using the server’s IP address.
+
+You can register a user with the `mongooseimctl` utility:
+`mongooseimctl register user domain password`
+
+For example:
+`mongooseimctl register user1 localhost GJ9TuHq8`
+
 
 ##### Adium
 
@@ -49,20 +71,17 @@ After registration, the user will connect automatically.
 
 Registered users wishing to add an existing account to Adium should enter the MongooseIM server’s IP address in the **Connect Server** field on the **Options** tab.
 
-##### Command line
-
-You can register a user with the `mongooseimctl` utility:  
-`mongooseimctl register user domain password`
-
-For example:  
-`mongooseimctl register user1 localhost GJ9TuHq8`
 
 #### Domains
 
-To use your system’s domain name instead of localhost, edit the following MongooseIM configuration file: `$REPO/rel/mongooseim/etc/ejabberd.cfg` (where `$REPO` is the repository root). Find the line that contains the following: `{hosts ["localhost"] }.` Replace localhost with your domain name, for example: `{hosts, ["example.org"] }.` Save the configuration file and restart the MongooseIM server. A user’s Jabber ID will then use the domain instead of localhost, for example: `user1@example.org`
+To use your system’s domain name instead of localhost, edit the following MongooseIM configuration file: `$REPO/_build/prod/rel/mongooseim/etc/ejabberd.cfg` (where `$REPO` is the repository root).
+Find the line that contains the following: `{hosts ["localhost"] }.` Replace localhost with your domain name, for example: `{hosts, ["example.org"] }`.
+Save the configuration file and restart the MongooseIM server.
+A user’s Jabber ID will then use the domain instead of localhost, for example: `user1@example.org`
 
-You can also configure multiple domains for one server:  
+You can also configure multiple domains for one server:
 `{hosts, ["example1.org", "example2.org"] }.`
+
 
 #### Get chatting!
 

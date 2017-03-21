@@ -34,7 +34,6 @@
          start/3,
          start/4,
          change_shaper/2,
-         reset_stream/1,
          starttls/2,
          compress/2,
          become_controller/2,
@@ -52,27 +51,26 @@
                 shaper_state,
                 c2s_pid,
                 max_stanza_size,
-                xml_stream_state,
+                parser,
                 timeout}).
 -type state() :: #state{}.
 
 -define(HIBERNATE_TIMEOUT, 90000).
--define(GEN_FSM, p1_fsm).
 
 %%====================================================================
 %% API
 %%====================================================================
 %%--------------------------------------------------------------------
-%% Function: start_link() -> {ok,Pid} | ignore | {error,Error}
+%% Function: start_link() -> {ok, Pid} | ignore | {error, Error}
 %% Description: Starts the server
 %%--------------------------------------------------------------------
--spec start_link(_,_,_,_) -> 'ignore' | {'error',_} | {'ok',pid()}.
+-spec start_link(_, _, _, _) -> 'ignore' | {'error', _} | {'ok', pid()}.
 start_link(Socket, SockMod, Shaper, MaxStanzaSize) ->
     gen_server:start_link(
       ?MODULE, [Socket, SockMod, Shaper, MaxStanzaSize], []).
 
 %%--------------------------------------------------------------------
-%% Function: start() -> {ok,Pid} | ignore | {error,Error}
+%% Function: start() -> {ok, Pid} | ignore | {error, Error}
 %% Description: Starts the server
 %%--------------------------------------------------------------------
 start(Socket, SockMod, Shaper) ->
@@ -84,23 +82,20 @@ start(Socket, SockMod, Shaper, MaxStanzaSize) ->
                   [Socket, SockMod, Shaper, MaxStanzaSize]),
     Pid.
 
--spec change_shaper(atom() | pid() | {atom(),_} | {'via',_,_},_) -> 'ok'.
+-spec change_shaper(atom() | pid() | {atom(), _} | {'via', _, _}, _) -> 'ok'.
 change_shaper(Pid, Shaper) ->
     gen_server:cast(Pid, {change_shaper, Shaper}).
 
-reset_stream(Pid) ->
-    gen_server:call(Pid, reset_stream).
-
 starttls(Pid, TLSSocket) ->
-    gen_server:call(Pid, {starttls, TLSSocket}).
+    gen_server_call_or_noproc(Pid, {starttls, TLSSocket}).
 
 compress(Pid, ZlibSocket) ->
-    gen_server:call(Pid, {compress, ZlibSocket}).
+    gen_server_call_or_noproc(Pid, {compress, ZlibSocket}).
 
 become_controller(Pid, C2SPid) ->
     gen_server:call(Pid, {become_controller, C2SPid}).
 
--spec close(atom() | pid() | {atom(),_} | {'via',_,_}) -> 'ok'.
+-spec close(atom() | pid() | {atom(), _} | {'via', _, _}) -> 'ok'.
 close(Pid) ->
     gen_server:cast(Pid, close).
 
@@ -115,7 +110,7 @@ close(Pid) ->
 %%                         {stop, Reason}
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
--spec init([any(),...]) -> {'ok',state()}.
+-spec init([any(), ...]) -> {'ok', state()}.
 init([Socket, SockMod, Shaper, MaxStanzaSize]) ->
     ShaperState = shaper:new(Shaper),
     Timeout = case SockMod of
@@ -139,52 +134,36 @@ init([Socket, SockMod, Shaper, MaxStanzaSize]) ->
 %%                                      {stop, Reason, State}
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
-handle_call({starttls, TLSSocket}, _From,
-            #state{xml_stream_state = XMLStreamState,
-                   c2s_pid = C2SPid,
-                   max_stanza_size = MaxStanzaSize} = State) ->
-    close_stream(XMLStreamState),
-    NewXMLStreamState = xml_stream:new(C2SPid, MaxStanzaSize),
+handle_call({starttls, TLSSocket}, _From, #state{parser = Parser} = State) ->
+    NewParser = reset_parser(Parser),
     NewState = State#state{socket = TLSSocket,
-                           sock_mod = ejabberd_tls,
-                           xml_stream_state = NewXMLStreamState},
-    case ejabberd_tls:recv_data(TLSSocket, "") of
+                           sock_mod = fast_tls,
+                           parser = NewParser},
+    case fast_tls:recv_data(TLSSocket, <<"">>) of
         {ok, TLSData} ->
             {reply, ok, process_data(TLSData, NewState), ?HIBERNATE_TIMEOUT};
         {error, _Reason} ->
             {stop, normal, ok, NewState}
     end;
 handle_call({compress, ZlibSocket}, _From,
-            #state{xml_stream_state = XMLStreamState,
-                   c2s_pid = C2SPid,
-                   max_stanza_size = MaxStanzaSize} = State) ->
-    close_stream(XMLStreamState),
-    NewXMLStreamState = xml_stream:new(C2SPid, MaxStanzaSize),
+  #state{parser = Parser, c2s_pid = C2SPid} = State) ->
+    NewParser = reset_parser(Parser),
     NewState = State#state{socket = ZlibSocket,
                            sock_mod = ejabberd_zlib,
-                           xml_stream_state = NewXMLStreamState},
+                           parser = NewParser},
     case ejabberd_zlib:recv_data(ZlibSocket, "") of
-	{ok, ZlibData} ->
-	    {reply, ok, process_data(ZlibData, NewState), ?HIBERNATE_TIMEOUT};
-	{error, inflate_size_exceeded} ->
-	    ?GEN_FSM:send_event(C2SPid, {xmlstreamerror, <<"XML stanza is too big">>}),
-	    {reply, ok, NewState, ?HIBERNATE_TIMEOUT};
-	{error, inflate_error} ->
-	    {stop, normal, ok, NewState}
+        {ok, ZlibData} ->
+            {reply, ok, process_data(ZlibData, NewState), ?HIBERNATE_TIMEOUT};
+        {error, inflate_size_exceeded} ->
+            apply(gen_fsm(), send_event,
+                [C2SPid, {xmlstreamerror, <<"XML stanza is too big">>}]),
+            {reply, ok, NewState, ?HIBERNATE_TIMEOUT};
+        {error, inflate_error} ->
+            {stop, normal, ok, NewState}
     end;
-handle_call(reset_stream, _From,
-            #state{xml_stream_state = XMLStreamState,
-                   c2s_pid = C2SPid,
-                   max_stanza_size = MaxStanzaSize} = State) ->
-    close_stream(XMLStreamState),
-    NewXMLStreamState = xml_stream:new(C2SPid, MaxStanzaSize),
-    Reply = ok,
-    {reply, Reply, State#state{xml_stream_state = NewXMLStreamState},
-     ?HIBERNATE_TIMEOUT};
 handle_call({become_controller, C2SPid}, _From, State) ->
-    XMLStreamState = xml_stream:new(C2SPid, State#state.max_stanza_size),
-    NewState = State#state{c2s_pid = C2SPid,
-                           xml_stream_state = XMLStreamState},
+    Parser = reset_parser(State#state.parser),
+    NewState = State#state{c2s_pid = C2SPid, parser = Parser},
     activate_socket(NewState),
     Reply = ok,
     {reply, Reply, NewState, ?HIBERNATE_TIMEOUT};
@@ -213,32 +192,37 @@ handle_cast(_Msg, State) ->
 %% Description: Handling all non call/cast messages
 %%--------------------------------------------------------------------
 handle_info({Tag, _TCPSocket, Data},
-	    #state{socket = Socket,
-		   c2s_pid = C2SPid,
-		   sock_mod = SockMod} = State)
-  when (Tag == tcp) or (Tag == ssl) or (Tag == ejabberd_xml) ->
+      #state{socket = Socket,
+       c2s_pid = C2SPid,
+       sock_mod = SockMod} = State)
+  when (Tag == tcp) or (Tag == ssl) ->
     case SockMod of
-	ejabberd_tls ->
-	    case ejabberd_tls:recv_data(Socket, Data) of
-		{ok, TLSData} ->
-		    {noreply, process_data(TLSData, State),
-		     ?HIBERNATE_TIMEOUT};
-		{error, _Reason} ->
-		    {stop, normal, State}
-	    end;
-	ejabberd_zlib ->
-	    case ejabberd_zlib:recv_data(Socket, Data) of
-		{ok, ZlibData} ->
-		    {noreply, process_data(ZlibData, State),
-		     ?HIBERNATE_TIMEOUT};
-		{error, inflate_size_exceeded} ->
-		    ?GEN_FSM:send_event(C2SPid, {xmlstreamerror, <<"XML stanza is too big">>}),
-		    {noreply, State, ?HIBERNATE_TIMEOUT};
-		{error, inflate_error} ->
-		    {stop, normal, State}
-	    end;
-	_ ->
-	    {noreply, process_data(Data, State), ?HIBERNATE_TIMEOUT}
+        fast_tls ->
+            mongoose_metrics:update(global,
+                            [data, xmpp, received, encrypted_size], size(Data)),
+            case fast_tls:recv_data(Socket, Data) of
+                {ok, TLSData} ->
+                    {noreply, process_data(TLSData, State),
+                    ?HIBERNATE_TIMEOUT};
+                {error, _Reason} ->
+                    {stop, normal, State}
+            end;
+        ejabberd_zlib ->
+            mongoose_metrics:update(global,
+                           [data, xmpp, received, compressed_size], size(Data)),
+            case ejabberd_zlib:recv_data(Socket, Data) of
+                {ok, ZlibData} ->
+                    {noreply, process_data(ZlibData, State),
+                    ?HIBERNATE_TIMEOUT};
+                {error, inflate_size_exceeded} ->
+                    apply(gen_fsm(), send_event,
+                       [C2SPid, {xmlstreamerror, <<"XML stanza is too big">>}]),
+                    {noreply, State, ?HIBERNATE_TIMEOUT};
+                {error, inflate_error} ->
+                    {stop, normal, State}
+            end;
+        _ ->
+            {noreply, process_data(Data, State), ?HIBERNATE_TIMEOUT}
     end;
 handle_info({Tag, _TCPSocket}, State)
   when (Tag == tcp_closed) or (Tag == ssl_closed) ->
@@ -267,14 +251,12 @@ handle_info(_Info, State) ->
 %% cleaning up. When it returns, the gen_server terminates with Reason.
 %% The return value is ignored.
 %%--------------------------------------------------------------------
-terminate(_Reason, #state{xml_stream_state = XMLStreamState,
-                          c2s_pid = C2SPid} = State) ->
-    close_stream(XMLStreamState),
-    if
-        C2SPid /= undefined ->
-            gen_fsm:send_event(C2SPid, closed);
-        true ->
-            ok
+terminate(_Reason, #state{parser = Parser,
+        c2s_pid = C2SPid} = State) ->
+    free_parser(Parser),
+    case C2SPid of
+        undefined -> ok;
+        _ -> gen_fsm:send_event(C2SPid, closed)
     end,
     catch (State#state.sock_mod):close(State#state.socket),
     ok.
@@ -290,7 +272,7 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%--------------------------------------------------------------------
 
--spec activate_socket(state()) -> 'ok' | {'tcp_closed',_}.
+-spec activate_socket(state()) -> 'ok' | {'tcp_closed', _}.
 activate_socket(#state{socket = Socket,
                        sock_mod = SockMod}) ->
     PeerName =
@@ -321,31 +303,65 @@ process_data([Element|Els], #state{c2s_pid = C2SPid} = State)
        element(1, Element) == xmlstreamstart;
       element(1, Element) == xmlstreamelement;
        element(1, Element) == xmlstreamend ->
-    if
-        C2SPid == undefined ->
+    case C2SPid of
+        undefined ->
             State;
-        true ->
+        _ ->
             catch gen_fsm:send_event(C2SPid, element_wrapper(Element)),
             process_data(Els, State)
     end;
 %% Data processing for connectors receivind data as string.
-process_data(Data,
-             #state{xml_stream_state = XMLStreamState,
-                    shaper_state = ShaperState,
-                    c2s_pid = C2SPid} = State) ->
+process_data(Data, #state{parser = Parser,
+                          shaper_state = ShaperState,
+                          max_stanza_size = MaxSize,
+                          c2s_pid = C2SPid} = State) ->
     ?DEBUG("Received XML on stream = \"~s\"", [Data]),
-    XMLStreamState1 = xml_stream:parse(XMLStreamState, Data),
-    {NewShaperState, Pause} = shaper:update(ShaperState, size(Data)),
-    if
-        C2SPid == undefined ->
-            ok;
-        Pause > 0 ->
-            erlang:start_timer(Pause, self(), activate);
-        true ->
-            activate_socket(State)
-    end,
-    State#state{xml_stream_state = XMLStreamState1,
-                shaper_state = NewShaperState}.
+    Size = size(Data),
+    mongoose_metrics:update(global,
+                              [data, xmpp, received, xml_stanza_size], Size),
+
+    maybe_run_keep_alive_hook(Size, State),
+    case exml_stream:parse(Parser, Data) of
+        {ok, NewParser, Elems} ->
+            {NewShaperState, Pause} = shaper:update(ShaperState, Size),
+            ValidElems =
+                replace_too_big_elems_with_stream_error(Elems, MaxSize),
+            [gen_fsm:send_event(C2SPid, wrap_if_xmlel(E)) || E <- ValidElems],
+            maybe_pause(Pause, State),
+            State#state{parser = NewParser,
+                        shaper_state = NewShaperState};
+        {error, Reason} ->
+            {NewShaperState, Pause} = shaper:update(ShaperState, Size),
+            gen_fsm:send_event(C2SPid, {xmlstreamerror, Reason}),
+            maybe_pause(Pause, State),
+            State#state{shaper_state = NewShaperState}
+    end.
+
+wrap_if_xmlel(#xmlel{} = E) -> {xmlstreamelement, E};
+wrap_if_xmlel(E) -> E.
+
+replace_too_big_elems_with_stream_error(Elems, MaxSize) ->
+    lists:map(fun(Elem) ->
+                        case exml:xml_size(Elem) > MaxSize of
+                            true  -> {xmlstreamerror, "XML stanza is too big"};
+                            false -> Elem
+                        end
+                  end, Elems).
+
+maybe_pause(_, #state{c2s_pid = undefined}) ->
+    ok;
+maybe_pause(Pause, _State) when Pause > 0 ->
+    erlang:start_timer(Pause, self(), activate);
+maybe_pause(_, State) ->
+    activate_socket(State).
+
+maybe_run_keep_alive_hook(Size, #state{c2s_pid = C2SPid})
+  when Size < 3, is_pid(C2SPid) ->
+    %% yes it can happen that the data is shorter than 3 bytes and contain
+    %% some part of xml but this will not harm the keep_alive_hook
+    gen_fsm:send_all_state_event(C2SPid, keep_alive_packet);
+maybe_run_keep_alive_hook(_, _) ->
+    ok.
 
 %% @doc Element coming from XML parser are wrapped inside xmlstreamelement
 %% When we receive directly xmlel tuple (from a socket module
@@ -357,9 +373,23 @@ element_wrapper(#xmlel{} = XMLElement) ->
 element_wrapper(Element) ->
     Element.
 
--spec close_stream('undefined' | {'xml_stream_state',_,atom() | port(),_,_,_})
-      -> 'ok' | 'true'.
-close_stream(undefined) ->
+reset_parser(undefined) ->
+    {ok, NewParser} = exml_stream:new_parser([{start_tag, <<"stream:stream">>}]),
+    NewParser;
+reset_parser(Parser) ->
+    {ok, NewParser} = exml_stream:reset_parser(Parser),
+    NewParser.
+
+free_parser(undefined) ->
     ok;
-close_stream(XMLStreamState) ->
-    xml_stream:close(XMLStreamState).
+free_parser(Parser) ->
+    exml_stream:free_parser(Parser).
+
+gen_server_call_or_noproc(Pid, Message) ->
+    try
+        gen_server:call(Pid, Message)
+    catch exit:{noproc, Extra} ->
+        {error, {noproc, Extra}}
+    end.
+
+gen_fsm() -> p1_fsm.

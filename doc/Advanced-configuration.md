@@ -4,13 +4,13 @@ For advanced configuration use the following files: `ejabberd.cfg`, `vm.args` an
 
 This file consists of multiple erlang tuples, terminated with a period. It can be found in `[MongooseIM root]/rel/files/`.
 
-The tuple order is important, unless the no host_config option is set. Retaining the default layout is recommended so that experienced MongooseIM users can smoothly traverse the file. 
+The tuple order is important, unless the no `host_config` option is set. Retaining the default layout is recommended so that experienced MongooseIM users can smoothly traverse the file.
 
 `ejabberd.cfg` is full of useful comments and in most cases they should be sufficient help in changing the configuration.
 
 ## Options
 
-* All options except `hosts`, `host` and `host_config` can be used in `host_config` tuple.
+* All options except `hosts`, `host`, `host_config`, `pool` and the ODBC options can be used in `host_config` tuple.
 
 * There are two kinds of local options - those that are kept separately for each domain in config file (defined inside `host_config`) and the options local for a node in the cluster.
 
@@ -39,9 +39,6 @@ The tuple order is important, unless the no host_config option is set. Retaining
         * `alarms_basic_handler` - logs alarms and stores a brief alarm summary
         * `alarms_folsom_handler` - stores alarm details in folsom metrics
     * **Example:** `{alarms, [{long_gc, 10000}, {large_heap, 1000000}, {handlers, [alarms_basic_handler]}]}.`
-
-* **watchdog_admins** (global)
-    * **Descritption:** List of JIDs, that should receive information about alarms.
 
 ### Served hostnames
 
@@ -132,7 +129,23 @@ The tuple order is important, unless the no host_config option is set. Retaining
 
 ### Database setup
 
-`odbc` prefixes may be misleading. Such options apply to all kinds of DB connections, not only pure ODBC.
+#### Connection pools
+
+* **pool** (multi, local)
+    * **Description:** Declares a named pool of connections to the database. At least one pool is required to connect to an SQL database.
+    * **Syntax:** `{pool, odbc, PoolName}.` or `{pool, odbc, PoolName, Options}.`
+    * **Examples:** `{pool, odbc, default}.`
+
+* **odbc_pool** (local)
+    * **Description:** Name of the default connection pool used to connect to the database.
+    * **Syntax:** `{odbc_pool, PoolName}`
+    * **Default:** `default`
+
+#### Connection setup
+
+The following options can be used to configure a connection pool. To set the options for all connection pools, put them on the top level of the configuration file. To set them for an individual pool, put them inside the `Options` list in a pool specification. Setting `odbc_server` is mandatory.
+
+*Note*: `odbc` prefixes may be misleading. Such options apply to all kinds of DB connections, not only pure ODBC.
 
 * **odbc_server** (local)
     * **Description:** SQL DB connection configuration. Currently supported DB types are `mysql` and `pgsql`.
@@ -147,6 +160,14 @@ The tuple order is important, unless the no host_config option is set. Retaining
 
 * **odbc_keepalive_interval** (local)
     * **Description:** When enabled, will send `SELECT 1` query through every DB connection at given interval to keep them open.
+    This option should be used to ensure that database connections are
+    restarted after they became broken (e.g. due to database restart or a load
+    balancer dropping connections). Currently, not every network related error
+    returned from a database driver to a regular query will imply a connection
+    restart.
+
+You should remember that SQL databases require also defining schema.
+See [Database backends configuration](./advanced-configuration/database-backends-configuration.md) for more information
 
 ### Traffic shapers
 
@@ -155,7 +176,8 @@ The tuple order is important, unless the no host_config option is set. Retaining
     * **Syntax:** `{shaper, AtomName, {maxrate, BytesPerSecond}}`
 
 * **max_fsm_queue** (local)
-    * **Description:** When enabled, will terminate certain processes (e.g. client handlers) that exceed message limit, to prevent resource exhaustion. **Use with caution!**
+    * **Description:** When enabled, will terminate certain processes (e.g. client handlers) that exceed message limit, to prevent resource exhaustion. This option is set for all the listeners but can be overridden for particular `ejabberd_s2s` or `ejabberd_service` listeners in their configurations. **Use with caution!**
+    * **Syntax:** `{max_fsm_queue, MaxFsmQueueLength}`
 
 ### Access control lists
 
@@ -196,6 +218,12 @@ The tuple order is important, unless the no host_config option is set. Retaining
     * **Description:** Default language for messages sent by server to users. You can get a full list of supported codes by executing `cd [MongooseIM root] ; ls apps/ejabberd/priv/*.msg | awk '{split($0,a,"/"); split(a[4],b,"."); print b[1]}'` (`en` is not listed there)
     * **Default:** `en`
 
+### Miscellaneous
+
+* **all_metrics_are_global** (local)
+    * **Description:** When enabled, all per-host metrics are merged into global equivalents. It means it is no longer possible to view individual host1, host2, host3, ... metrics, only sums are available. This option significantly reduces CPU and (especially) memory footprint in setups with exceptionally many domains (thousands, tens of thousands).
+    * **Default:** `false`
+
 ### Modules
 
 For specific configuration, please refer to [Modules](advanced-configuration/Modules.md) page.
@@ -210,6 +238,29 @@ The `host_config` allows configuring most options separately for specific domain
 * **host_config** (multi, local)
     * **Syntax:** `{host_config, Domain, [ {{add, modules}, [{mod_some, Opts}]}, {access, c2s, [{deny, local}]}, ... ]}.`
 
+### Outgoing HTTP connections
+
+The `http_connections` option configures a list of named pools of outgoing HTTP connections that may be used by various modules. Each of the pools has a name (atom) and a list of options:
+
+* **Syntax:** `{http_connections, [{PoolName1, PoolOptions1}, {PoolName2, PoolOptions2}, ...]}.`
+
+Following pool options are recognized - all of them are optional.
+
+* `{server, HostName}` - string, default: `"http://localhost"` - the URL of the destination HTTP server (including port number if needed).
+* `{pool_size, Number}` - positive integer, default: `20` - number of workers in the connection pool.
+* `{max_overflow, Number}` - non-negative integer, default: `5` - maximum number of extra workers that can be allocated when the whole pool is busy.
+* `{path_prefix, Prefix}` - string, default: `"/"` - the part of the destination URL that is appended to the host name (`host` option).
+* `{pool_timeout, TimeoutValue}` - non-negative integer, default: `200` - maximum number of milliseconds to wait for an available worker from the pool.
+* `{request_timeout, TimeoutValue}` - non-negative integer, default: `2000` - maximum number of milliseconds to wait for the HTTP response.
+
+**Example:**
+```
+{http_connections, [{conn1, [{server, "http://my.server:8080"},
+                             {pool_size, 50},
+                             {path_prefix, "/my/path/"}]}
+                   ]}.
+```
+
 # vm.args
 
 This file contains parameters passed directly to the Erlang VM. It can be found in `[MongooseIM root]/rel/files/`.
@@ -218,7 +269,7 @@ Section below describes the default options.
 
 ## Options
 
-*    `-sname` - Erlang node name. Can be changed to `name`, if necessary
+* `-sname` - Erlang node name. Can be changed to `name`, if necessary
 * `-setcookie` - Erlang cookie. All nodes in a cluster must use the same cookie value.
 * `+K` - Enables kernel polling. It improves the stability when a large number of sockets is opened, but some systems might benefit from disabling it. Might be a subject of individual load testing.
 * `+A 5` - Sets the asynchronous threads number. Async threads improve I/O operations efficiency by relieving scheduler threads of IO waits.
@@ -229,6 +280,31 @@ Section below describes the default options.
 
 # app.config
 
-A file with Erlang application configuration. It can be found in `[MongooseIM root]/rel/files/`. By default only Lager config can be found there. Check [Lager's documentation](https://github.com/basho/lager) for more information.
+A file with Erlang application configuration. It can be found in `[MongooseIM root]/rel/files/`.
+By default only following applications can be found there:
 
-Here you can change logs location and file names (`file`), rotation strategy (`size` and `count`) and date formatting (`date`). Ignore log level parameters - they are overridden with the value in `ejabberd.cfg`.
+* `lager` - check [Lager's documentation](https://github.com/basho/lager) for more information.
+   
+    Here you can change logs location and file names (`file`), rotation strategy (`size` and `count`) 
+   and date formatting (`date`). Ignore log level parameters - they are overridden with the value in `ejabberd.cfg`.
+
+* `ejabberd` - set `keep_lager_intact` parameter to `true` when you want
+    use `lager` log level parameters from `app.config`. Missing value or
+    `false` for this parameter means override log levels with the value
+    in `ejabberd.cfg`.
+
+* `ssl` only `session_lifetime` parameter is specified in
+    this file. Its default value is **600s**. This parameter says for how
+    long ssl session should remain in the cache for further re-use,
+    should `ssl session resumption` happen.
+
+
+# Configuring TLS: Certificates & Keys
+
+TLS is configured in one of two ways: some modules need a private key and certificate (chain) in __separate__ files, while others need both in a __single__ file. This is because recent additions use OTP's `ssl` library, while older modules use `p1_tls`, respectively.
+
+* Client-to-server connections need both in the __same__ `.pem` file (find more information under *Options* in *Basic Configuration Overview* and *Listener Modules*)
+* Server-to-server connections need both in the __same__ `.pem` file (find more information under Listening Ports in *Advanced Configuration Overview*)
+* BOSH & Web Sockets use Cowboy, which uses OTP's `ssl` module like all our HTTPS endpoints, so they need them in __separate__ files (find more information in *Listener Modules*)
+
+When the private key and certificate (chain) need be in the same file it should suffice to concatenate them.

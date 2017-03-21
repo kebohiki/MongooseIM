@@ -2,7 +2,7 @@
 
 main(Directories) ->
     Files = lists:foldl(fun(Dir, Acc) ->
-                    Wildcard = filename:join([Dir, "ejabberd_tests.*.logs",
+                    Wildcard = filename:join([Dir, "*.logs",
                                               "*", "suite.summary"]),
                     Acc ++ filelib:wildcard(Wildcard)
             end, [], Directories),
@@ -21,5 +21,5 @@ main(Directories) ->
         true ->
             erlang:halt(100404);
         _ ->
-            erlang:halt(Failed)
+            erlang:halt(Failed + AutoSkipped)
     end.

@@ -10,7 +10,7 @@
 %%% The differencies from `mod_mam_odbc_user' are:
 %%%
 %%% - This module deletes cached data after room deletion.
-%%% 
+%%%
 %%% @end
 %%%-------------------------------------------------------------------
 -module(mod_mam_muc_cache_user).
@@ -21,7 +21,7 @@
 %% ejabberd handlers
 -export([cached_archive_id/3,
          store_archive_id/3,
-         remove_archive/3]).
+         remove_archive/4]).
 
 %% API
 -export([clean_cache/1]).
@@ -52,8 +52,7 @@ su_key(#jid{lserver = LServer, luser = LUser}) ->
     {LServer, LUser}.
 
 room_pid(RoomJID=#jid{}) ->
-    {ok, Pid} = mod_muc:room_jid_to_pid(RoomJID),
-    Pid.
+    ejabberd_hooks:run_fold(muc_room_pid, RoomJID#jid.lserver, undefined, [RoomJID]).
 
 %% ----------------------------------------------------------------------
 %% gen_mod callbacks
@@ -88,11 +87,13 @@ stop_server(_Host) ->
 start_muc(Host, _Opts) ->
     ejabberd_hooks:add(mam_muc_archive_id, Host, ?MODULE, cached_archive_id, 30),
     ejabberd_hooks:add(mam_muc_archive_id, Host, ?MODULE, store_archive_id, 70),
+    ejabberd_hooks:add(mam_muc_remove_archive, Host, ?MODULE, remove_archive, 100),
     ok.
 
 stop_muc(Host) ->
     ejabberd_hooks:delete(mam_muc_archive_id, Host, ?MODULE, cached_archive_id, 30),
     ejabberd_hooks:delete(mam_muc_archive_id, Host, ?MODULE, store_archive_id, 70),
+    ejabberd_hooks:delete(mam_muc_remove_archive, Host, ?MODULE, remove_archive, 100),
     ok.
 
 
@@ -116,8 +117,10 @@ store_archive_id(UserID, _Host, ArcJID) ->
     maybe_cache_archive_id(ArcJID, UserID),
     UserID.
 
-remove_archive(_Host, _UserID, ArcJID) ->
-    clean_cache(ArcJID).
+%% #rh
+remove_archive(Acc, _Host, _UserID, ArcJID) ->
+    clean_cache(ArcJID),
+    Acc.
 
 %%====================================================================
 %% Internal functions
@@ -134,7 +137,12 @@ maybe_cache_archive_id(ArcJID, UserID) ->
 %% @doc Put the user id into cache.
 %% @private
 cache_archive_id(ArcJID, UserID) ->
-    gen_server:call(srv_name(), {cache_archive_id, ArcJID, UserID, room_pid(ArcJID)}).
+    case room_pid(ArcJID) of
+        {error, not_found} ->
+            ok;
+        RoomPid ->
+            gen_server:call(srv_name(), {cache_archive_id, ArcJID, UserID, RoomPid})
+    end.
 
 lookup_archive_id(ArcJID) ->
     try
@@ -177,8 +185,13 @@ init([]) ->
 %%--------------------------------------------------------------------
 handle_call({cache_archive_id, ArcJID, UserID, RoomPid}, _From, State) ->
     Key = su_key(ArcJID),
-    MonRef = erlang:monitor(process, RoomPid),
-    ets:insert(tbl_name_monitor(), {MonRef, Key}),
+    case RoomPid of
+        {ok, processless} ->
+            ok;
+        {ok, Pid} ->
+            MonRef = erlang:monitor(process, Pid),
+            ets:insert(tbl_name_monitor(), {MonRef, Key})
+    end,
     ets:insert(tbl_name_archive_id(), {Key, UserID}),
     {reply, ok, State}.
 

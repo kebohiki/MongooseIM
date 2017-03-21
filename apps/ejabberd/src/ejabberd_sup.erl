@@ -35,13 +35,6 @@ start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
-    Randoms =
-        {randoms,
-         {randoms, start_link, []},
-         permanent,
-         brutal_kill,
-         worker,
-         [randoms]},
     Hooks =
         {ejabberd_hooks,
          {ejabberd_hooks, start_link, []},
@@ -49,6 +42,13 @@ init([]) ->
          brutal_kill,
          worker,
          [ejabberd_hooks]},
+    Cleaner =
+        {mongoose_cleaner,
+         {mongoose_cleaner, start_link, []},
+         permanent,
+         brutal_kill,
+         worker,
+         [mongoose_cleaner]},
     Router =
         {ejabberd_router,
          {ejabberd_router, start_link, []},
@@ -169,12 +169,16 @@ init([]) ->
          brutal_kill,
          worker,
          [mod_muc_iq]},
+    MAM =
+        {mod_mam_sup,
+         {mod_mam_sup, start_link, []},
+         permanent, infinity, supervisor, [mod_mam_sup]},
     ShaperSpecs = shaper_srv:child_specs(),
 
     {ok, {{one_for_one, 10, 1},
           ShaperSpecs ++
-          [Randoms,
-           Hooks,
+          [Hooks,
+           Cleaner,
            SMBackendSupervisor,
            Router,
            SM,
@@ -190,4 +194,5 @@ init([]) ->
            IQSupervisor,
            STUNSupervisor,
            Listener,
-           MucIQ]}}.
+           MucIQ,
+           MAM]}}.

@@ -18,24 +18,25 @@ start_link(Opts) ->
     PoolSize = proplists:get_value(pool_size, Opts, 10),
     RedoOpts = proplists:get_value(worker_config, Opts, []),
     ChildMods = [redo, redo_redis_proto, redo_uri],
-    ChildMFA = {redo, start_link, [undefined, RedoOpts]},
+    ChildMF = {redo, start_link},
+    ChildArgs = {for_all, [undefined, RedoOpts]},
 
     supervisor:start_child(ejabberd_sm_backend_sup,
                            {ejabberd_redis_sup,
                             {cuesport, start_link,
-                             [?POOL_NAME, PoolSize, ChildMods, ChildMFA]},
+                             [?POOL_NAME, PoolSize, ChildMods, ChildMF, ChildArgs]},
                             transient, 2000, supervisor, [cuesport | ChildMods]}).
 
--spec cmd(iolist()) -> binary()
-                | [binary() | [binary() | integer()] | integer() | {'error',_}]
+-spec cmd(iolist()) -> undefined | binary()
+                | [binary() | [binary() | integer()] | integer() | {'error', _}]
                 | integer()
-                | {'error',_}.
+                | {'error', _}.
 cmd(Cmd) ->
     redo:cmd(cuesport:get_worker(?POOL_NAME), Cmd).
 
--spec cmd(iolist(), integer()) -> binary()
-              | [binary() | [binary() | integer()] | integer() | {'error',_}]
+-spec cmd(iolist(), integer()) -> undefined | binary()
+              | [binary() | [binary() | integer()] | integer() | {'error', _}]
               | integer()
-              | {'error',_}.
+              | {'error', _}.
 cmd(Cmd, Timeout) ->
     redo:cmd(cuesport:get_worker(?POOL_NAME), Cmd, Timeout).

@@ -40,7 +40,7 @@
 
 -export([get_user_roster/2, get_subscription_lists/3,
          get_jid_info/4, process_item/2, in_subscription/6,
-         out_subscription/4]).
+         out_subscription/5]).
 
 -export([config_change/4]).
 
@@ -151,9 +151,10 @@ process_item(RosterItem, _Host) ->
         _ -> RosterItem#roster{subscription = both, ask = none}
     end.
 
-get_subscription_lists({F, T, P}, User, Server) ->
-    LUser = jlib:nodeprep(User),
-    LServer = jlib:nameprep(Server),
+get_subscription_lists(Acc, User, Server) ->
+    {F, T, P} = mongoose_acc:get(subscription_lists, Acc, {[], [], []}),
+    LUser = jid:nodeprep(User),
+    LServer = jid:nameprep(Server),
     US = {LUser, LServer},
     DisplayedGroups = get_user_displayed_groups(US),
     SRUsers = lists:usort(lists:flatmap(fun (Group) ->
@@ -161,13 +162,14 @@ get_subscription_lists({F, T, P}, User, Server) ->
                                         end,
                                         DisplayedGroups)),
     SRJIDs = [{U1, S1, <<"">>} || {U1, S1} <- SRUsers],
-    {lists:usort(SRJIDs ++ F), lists:usort(SRJIDs ++ T), P}.
+    NewLists = {lists:usort(SRJIDs ++ F), lists:usort(SRJIDs ++ T), P},
+    mongoose_acc:put(subscription_lists, NewLists, Acc).
 
 get_jid_info({Subscription, Groups}, User, Server, JID) ->
-    LUser = jlib:nodeprep(User),
-    LServer = jlib:nameprep(Server),
+    LUser = jid:nodeprep(User),
+    LServer = jid:nameprep(Server),
     US = {LUser, LServer},
-    {U1, S1, _} = jlib:jid_tolower(JID),
+    {U1, S1, _} = jid:to_lower(JID),
     US1 = {U1, S1},
     SRUsers = get_user_to_groups_map(US, false),
     case dict:find(US1, SRUsers) of
@@ -180,16 +182,28 @@ get_jid_info({Subscription, Groups}, User, Server, JID) ->
     end.
 
 in_subscription(Acc, User, Server, JID, Type, _Reason) ->
-    process_subscription(in, User, Server, JID, Type, Acc).
+    case process_subscription(in, User, Server, JID, Type) of
+        stop ->
+            {stop, Acc};
+        {stop, false} ->
+            {stop, false};
+        _ -> Acc
+    end.
 
-out_subscription(User, Server, JID, Type) ->
-    process_subscription(out, User, Server, JID, Type, false).
+out_subscription(Acc, User, Server, JID, Type) ->
+    case process_subscription(out, User, Server, JID, Type) of
+        stop ->
+            {stop, Acc};
+        {stop, false} ->
+            {stop, Acc};
+        _ -> Acc
+    end.
 
-process_subscription(Direction, User, Server, JID, _Type, Acc) ->
-    LUser = jlib:nodeprep(User),
-    LServer = jlib:nameprep(Server),
+process_subscription(Direction, User, Server, JID, _Type) ->
+    LUser = jid:nodeprep(User),
+    LServer = jid:nameprep(Server),
     US = {LUser, LServer},
-    {U1, S1, _} = jlib:jid_tolower(jlib:jid_remove_resource(JID)),
+    {U1, S1, _} = jid:to_lower(jid:to_bare(JID)),
     US1 = {U1, S1},
     DisplayedGroups = get_user_displayed_groups(US),
     SRUsers = lists:usort(lists:flatmap(
@@ -203,7 +217,7 @@ process_subscription(Direction, User, Server, JID, _Type, Acc) ->
                 in -> {stop, false};
                 out -> stop
             end;
-        false -> Acc
+        false -> false
     end.
 
 %%====================================================================
@@ -213,8 +227,8 @@ process_subscription(Direction, User, Server, JID, _Type, Acc) ->
 config_change(Acc, Host, ldap, _NewConfig) ->
     Proc = gen_mod:get_module_proc(Host, ?MODULE),
     Mods = ejabberd_config:get_local_option({modules, Host}),
-    Opts = proplists:get_value(?MODULE,Mods,[]),
-    ok = gen_server:call(Proc,{new_config, Host, Opts}),
+    Opts = proplists:get_value(?MODULE, Mods, []),
+    ok = gen_server:call(Proc, {new_config, Host, Opts}),
     Acc;
 config_change(Acc, _, _, _) ->
     Acc.
@@ -225,7 +239,7 @@ config_change(Acc, _, _, _) ->
 %%====================================================================
 init([Host, Opts]) ->
     State = parse_options(Host, Opts),
-    process_flag(trap_exit,true),
+    process_flag(trap_exit, true),
     cache_tab:new(shared_roster_ldap_user,
                   [{max_size, State#state.user_cache_size}, {lru, false},
                    {life_time, State#state.user_cache_validity}]),
@@ -422,7 +436,7 @@ search_group_info(State, Group) ->
                                            end,
                                   JIDs = lists:foldl(
                                            fun ({ok, UID}, L) ->
-                                                   PUID = jlib:nodeprep(UID),
+                                                   PUID = jid:nodeprep(UID),
                                                    case PUID of
                                                        error ->
                                                            L;
@@ -470,13 +484,13 @@ get_user_part_re(String, Pattern) ->
     case catch re:run(String, Pattern) of
         {match, Captured} ->
             {First, Len} = lists:nth(2, Captured),
-            Result = str:sub_string(String, First + 1, First + Len),
+            Result = binary:part(String, First, Len),
             {ok, Result};
         _ -> {error, badmatch}
     end.
 
 parse_options(Host, Opts) ->
-    Eldap_ID = atom_to_binary(gen_mod:get_module_proc(Host, ?MODULE),utf8),
+    Eldap_ID = atom_to_binary(gen_mod:get_module_proc(Host, ?MODULE), utf8),
     Cfg = eldap_utils:get_config(Host, Opts),
     GroupAttr = eldap_utils:get_mod_opt(ldap_groupattr, Opts,
                                         fun iolist_to_binary/1,
@@ -557,7 +571,7 @@ parse_options(Host, Opts) ->
     GroupFilter = case ConfigFilter of
                       <<"">> -> GroupSubFilter;
                       _ ->
-                          <<"(&", GroupSubFilter/binary, ConfigFilter/binary,")">>
+                          <<"(&", GroupSubFilter/binary, ConfigFilter/binary, ")">>
                   end,
     #state{host = Host, eldap_id = Eldap_ID,
            servers = Cfg#eldap_config.servers,

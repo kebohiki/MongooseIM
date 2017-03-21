@@ -43,15 +43,18 @@
 
 init(_Host, _Opts) ->
     mnesia:create_table(private_storage,
-			[{disc_only_copies, [node()]},
-			 {attributes, record_info(fields, private_storage)}]),
+                        [{disc_only_copies, [node()]},
+                         {attributes, record_info(fields, private_storage)}]),
 
     mnesia:add_table_copy(private_storage, node(), disc_only_copies),
     ok.
 
 multi_set_data(LUser, LServer, NS2XML) ->
     F = fun() -> multi_set_data_t(LUser, LServer, NS2XML) end,
-    mnesia:transaction(F).
+    case mnesia:transaction(F) of
+        {atomic, ok} -> ok;
+        {aborted, Reason} -> {aborted, Reason}
+    end.
 
 multi_set_data_t(LUser, LServer, NS2XML) ->
     [set_data_t(LUser, LServer, NS, XML) || {NS, XML} <- NS2XML],
@@ -72,7 +75,7 @@ get_data(LUser, LServer, NS, Default) ->
 
 remove_user(LUser, LServer) ->
     F = fun() ->
-		NSs = select_namespaces_t(LUser, LServer),
+                NSs = select_namespaces_t(LUser, LServer),
         [delete_record_t(LUser, LServer, NS) || NS <- NSs]
         end,
     mnesia:transaction(F).
@@ -87,4 +90,3 @@ select_namespaces_t(LUser, LServer) ->
 
 delete_record_t(LUser, LServer, NS) ->
     mnesia:delete({private_storage, {LUser, LServer, NS}}).
-

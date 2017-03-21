@@ -123,7 +123,7 @@ get_sm_commands(Acc, _From, #jid{lserver = LServer} = To, <<"">>, Lang) ->
                         _ -> []
                     end,
             Nodes = [#xmlel{name = <<"item">>,
-                            attrs = [{<<"jid">>, jlib:jid_to_binary(To)},
+                            attrs = [{<<"jid">>, jid:to_binary(To)},
                                      {<<"node">>, ?NS_COMMANDS},
                                      {<<"name">>, translate:translate(Lang, <<"Commands">>)}]}],
             {result, Items ++ Nodes}
@@ -274,18 +274,18 @@ ping_item(Acc, _From, #jid{lserver = Server} = _To, Lang) ->
                    adhoc:request()) -> {error, _} | adhoc:response().
 ping_command(_Acc, _From, _To,
              #adhoc_request{lang = Lang,
-                            node = <<"ping">>,
-                            sessionid = _Sessionid,
-                            action = Action} = Request) ->
-    if
-        Action == <<"">>; Action == <<"execute">> ->
-            adhoc:produce_response(
-              Request,
-              #adhoc_response{status = completed,
-                              notes = [{<<"info">>, translate:translate(
-                                                      Lang,
-                                                      <<"Pong">>)}]});
+                            node = <<"ping">> = Node,
+                            session_id = SessionID,
+                            action = Action}) ->
+    case Action == <<"">> orelse Action == <<"execute">> of
         true ->
+            adhoc:produce_response(
+              #adhoc_response{lang = Lang,
+                              node = Node,
+                              session_id = SessionID,
+                              status = completed,
+                              notes = [{<<"info">>, translate:translate(Lang, <<"Pong">>)}]});
+        false ->
             {error, ?ERR_BAD_REQUEST}
     end;
 ping_command(Acc, _From, _To, _Request) ->

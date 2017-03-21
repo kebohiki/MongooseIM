@@ -22,33 +22,57 @@
 %% XML
 -export([is_archived_elem_for/2,
          replace_archived_elem/3,
+         replace_x_user_element/4,
          append_archived_elem/3,
          delete_archived_elem/2,
+         delete_x_user_element/1,
+         packet_to_x_user_jid/1,
          get_one_of_path/2,
          get_one_of_path/3,
-         is_complete_message/3,
-         wrap_message/5,
+         is_archivable_message/3,
+         wrap_message/6,
          result_set/4,
-         result_query/1,
-         result_prefs/3,
+         result_query/2,
+         result_prefs/4,
+         make_fin_message/5,
+         make_fin_element/4,
          parse_prefs/1,
          borders_decode/1,
-         decode_optimizations/1]).
+         decode_optimizations/1,
+         form_borders_decode/1,
+         form_decode_optimizations/1,
+         is_mam_result_message/1]).
+
+%% Forms
+-export([
+    form_field_value_s/2,
+    form_field_value/2,
+    message_form/3,
+    form_to_text/1
+]).
+
+%% Text search
+-export([
+    normalize_search_text/1,
+    normalize_search_text/2,
+    packet_to_search_body/3,
+    has_full_text_search/2
+]).
 
 %% JID serialization
 -export([jid_to_opt_binary/2,
          expand_minified_jid/2]).
 
 %% SQL
--export([success_sql_query/2]).
+-export([success_sql_query/2, success_sql_execute/3]).
 
 %% Other
 -export([maybe_integer/2,
          maybe_min/2,
          maybe_max/2,
-         is_function_exist/3,
          apply_start_border/2,
-         apply_end_border/2]).
+         apply_end_border/2,
+         is_last_page/4]).
 
 %% Ejabberd
 -export([send_message/3,
@@ -58,20 +82,20 @@
 
 -ifdef(MAM_INLINE_UTILS).
 -compile({inline, [
-        rsm_ns_binary/0,
-        mam_ns_binary/0,
-        now_to_microseconds/1,
-        iso8601_datetime_binary_to_timestamp/1,
-        is_archived_elem_for/2,
-        is_valid_message/3,
-        is_valid_message_type/3,
-        is_valid_message_children/3,
-        encode_compact_uuid/2,
-        get_one_of_path/3,
-        delay/2,
-        forwarded/3,
-        result/3,
-        valid_behavior/1]}).
+                   rsm_ns_binary/0,
+                   mam_ns_binary/0,
+                   now_to_microseconds/1,
+                   iso8601_datetime_binary_to_timestamp/1,
+                   is_archived_elem_for/2,
+                   is_valid_message/3,
+                   is_valid_message_type/3,
+                   is_valid_message_children/3,
+                   encode_compact_uuid/2,
+                   get_one_of_path/3,
+                   delay/2,
+                   forwarded/3,
+                   result/4,
+                   valid_behavior/1]}).
 -endif.
 
 -include_lib("ejabberd/include/ejabberd.hrl").
@@ -86,11 +110,11 @@
 
 %% Constants
 rsm_ns_binary() -> <<"http://jabber.org/protocol/rsm">>.
-mam_ns_binary() -> <<"urn:xmpp:mam:tmp">>.
 
 %% ----------------------------------------------------------------------
 %% Datetime types
--type iso8601_datetime_binary() :: binary().
+-type ne_binary() :: <<_:8, _:_*8>>.
+-type iso8601_datetime_binary() :: ne_binary().
 %% Microseconds from 01.01.1970
 -type unix_timestamp() :: mod_mam:unix_timestamp().
 
@@ -128,13 +152,13 @@ microseconds_to_now(MicroSeconds) when is_integer(MicroSeconds) ->
 
 %% @doc Returns time in `now()' format.
 -spec iso8601_datetime_binary_to_timestamp(iso8601_datetime_binary())
-        -> erlang:timestamp().
+        -> erlang:timestamp() | undefined.
 iso8601_datetime_binary_to_timestamp(DateTime) when is_binary(DateTime) ->
     jlib:datetime_binary_to_timestamp(DateTime).
 
 
 -spec datetime_to_microseconds(calendar:datetime()) -> integer().
-datetime_to_microseconds({{_,_,_}, {_,_,_}} = DateTime) ->
+datetime_to_microseconds({{_, _, _}, {_, _, _}} = DateTime) ->
     S1 = calendar:datetime_to_gregorian_seconds(DateTime),
     S0 = calendar:datetime_to_gregorian_seconds({{1970, 1, 1}, {0, 0, 0}}),
     Seconds = S1 - S0,
@@ -159,7 +183,7 @@ generate_message_id() ->
 %%
 %% It removes a leading 0 from 64-bit binary representation.
 %% It puts node id as a last byte.
-%% The maximum date, that can be encoded is `{{4253,5,31},{22,20,37}}'.
+%% The maximum date, that can be encoded is `{{4253, 5, 31}, {22, 20, 37}}'.
 -spec encode_compact_uuid(integer(), integer()) -> integer().
 encode_compact_uuid(Microseconds, NodeId)
     when is_integer(Microseconds), is_integer(NodeId) ->
@@ -167,7 +191,7 @@ encode_compact_uuid(Microseconds, NodeId)
 
 
 %% @doc Extract date and node id from a message id.
--spec decode_compact_uuid(integer()) -> {integer(),byte()}.
+-spec decode_compact_uuid(integer()) -> {integer(), byte()}.
 decode_compact_uuid(Id) ->
     Microseconds = Id bsr 8,
     NodeId = Id band 255,
@@ -180,10 +204,7 @@ mess_id_to_external_binary(MessID) when is_integer(MessID) ->
     list_to_binary(integer_to_list(MessID, 32)).
 
 
--spec maybe_external_binary_to_mess_id('undefined' | binary())
-                                                -> 'undefined' | integer().
-maybe_external_binary_to_mess_id(undefined) ->
-    undefined;
+-spec maybe_external_binary_to_mess_id(binary()) -> undefined | integer().
 maybe_external_binary_to_mess_id(<<>>) ->
     undefined;
 maybe_external_binary_to_mess_id(BExtMessID) ->
@@ -193,7 +214,7 @@ maybe_external_binary_to_mess_id(BExtMessID) ->
 %% @doc Decode a message ID received from the user.
 -spec external_binary_to_mess_id(binary()) -> integer().
 external_binary_to_mess_id(BExtMessID) when is_binary(BExtMessID) ->
-    list_to_integer(binary_to_list(BExtMessID), 32).
+    binary_to_integer(BExtMessID, 32).
 
 %% -----------------------------------------------------------------------
 %% XML
@@ -205,27 +226,64 @@ is_archived_elem_for(#xmlel{name = <<"archived">>, attrs=As}, By) ->
 is_archived_elem_for(_, _) ->
     false.
 
+is_x_user_element(#xmlel{name = <<"x">>, attrs = As}) ->
+    lists:member({<<"xmlns">>, ?NS_MUC_USER}, As);
+is_x_user_element(_) ->
+    false.
 
--spec replace_archived_elem(By :: binary(), Id :: binary(), jlib:xmlel()
-                            ) -> jlib:xmlel().
+-spec replace_archived_elem(By :: binary(), Id :: binary(), jlib:xmlel()) -> jlib:xmlel().
 replace_archived_elem(By, Id, Packet) ->
     append_archived_elem(By, Id,
-    delete_archived_elem(By, Packet)).
+                         delete_archived_elem(By, Packet)).
 
 
--spec append_archived_elem(By :: binary(), Id :: binary(), jlib:xmlel()
-                          ) -> jlib:xmlel().
+-spec replace_x_user_element(FromJID :: ejabberd:jid(), Role :: mod_muc:role(),
+                             Affiliation :: mod_muc:affiliation(), jlib:xmlel()) -> jlib:xmlel().
+replace_x_user_element(FromJID, Role, Affiliation, Packet) ->
+    append_x_user_element(FromJID, Role, Affiliation,
+                          delete_x_user_element(Packet)).
+
+
+-spec append_archived_elem(By :: binary(), Id :: binary(), jlib:xmlel()) -> jlib:xmlel().
 append_archived_elem(By, Id, Packet) ->
     Archived = #xmlel{
-        name = <<"archived">>,
-        attrs=[{<<"by">>, By}, {<<"id">>, Id}]},
+                  name = <<"archived">>,
+                  attrs=[{<<"by">>, By}, {<<"id">>, Id}]},
     xml:append_subtags(Packet, [Archived]).
 
+append_x_user_element(FromJID, Role, Affiliation, Packet) ->
+    ItemElem = x_user_item(FromJID, Role, Affiliation),
+    X = #xmlel{
+        name = <<"x">>,
+        attrs = [{<<"xmlns">>, ?NS_MUC_USER}],
+        children = [ItemElem]},
+    xml:append_subtags(Packet, [X]).
+
+x_user_item(FromJID, Role, Affiliation) ->
+    #xmlel{
+       name = <<"item">>,
+       attrs = [{<<"affiliation">>, atom_to_binary(Affiliation, latin1)},
+                {<<"jid">>, jid:to_binary(FromJID)},
+                {<<"role">>, atom_to_binary(Role, latin1)}]}.
 
 -spec delete_archived_elem(By :: binary(), jlib:xmlel()) -> jlib:xmlel().
 delete_archived_elem(By, Packet=#xmlel{children=Cs}) ->
     Packet#xmlel{children=[C || C <- Cs, not is_archived_elem_for(C, By)]}.
 
+-spec delete_x_user_element(jlib:xmlel()) -> jlib:xmlel().
+delete_x_user_element(Packet=#xmlel{children=Cs}) ->
+    Packet#xmlel{children=[C || C <- Cs, not is_x_user_element(C)]}.
+
+-spec packet_to_x_user_jid(jlib:xmlel()) -> ejabberd:jid() | error | undefined.
+packet_to_x_user_jid(#xmlel{children=Cs}) ->
+    case [C || C <- Cs, is_x_user_element(C)] of
+        [] -> undefined;
+        [X|_] ->
+            case exml_query:path(X, [{element, <<"item">>}, {attr, <<"jid">>}]) of
+                undefined -> undefined;
+                BinaryJid -> jid:from_binary(BinaryJid)
+            end
+    end.
 
 -spec get_one_of_path(_, list(T)) -> T when T :: any().
 get_one_of_path(Elem, List) ->
@@ -246,14 +304,17 @@ get_one_of_path(_Elem, [], Def) ->
 %%
 %% Servers SHOULD NOT archive messages that do not have a `<body/>' child tag.
 %% Servers SHOULD NOT delayed messages.
+%%
+%% From v0.3: it is expected that all messages that hold meaningful content,
+%% rather than state changes such as Chat State Notifications, would be archived.
 %% @end
--spec is_complete_message(Mod :: module(), Dir :: incoming | outgoing,
-                          Packet :: jlib:xmlel()) -> boolean().
-is_complete_message(Mod, Dir, Packet=#xmlel{name = <<"message">>}) ->
+-spec is_archivable_message(Mod :: module(), Dir :: incoming | outgoing,
+                            Packet :: jlib:xmlel()) -> boolean().
+is_archivable_message(Mod, Dir, Packet=#xmlel{name = <<"message">>}) ->
     Type = xml:get_tag_attr_s(<<"type">>, Packet),
     is_valid_message_type(Mod, Dir, Type) andalso
-    is_valid_message(Mod, Dir, Packet);
-is_complete_message(_, _, _) ->
+        is_valid_message(Mod, Dir, Packet);
+is_archivable_message(_, _, _) ->
     false.
 
 is_valid_message_type(_, _, <<"">>)          -> true;
@@ -269,83 +330,61 @@ is_valid_message(_Mod, _Dir, Packet) ->
     Result   = xml:get_subtag(Packet, <<"result">>),
     %% Used in mod_offline
     Delay    = xml:get_subtag(Packet, <<"delay">>),
-    is_valid_message_children(Body, Result, Delay).
+    %% Message Processing Hints (XEP-0334)
+    NoStore  = xml:get_subtag(Packet, <<"no-store">>),
+    is_valid_message_children(Body, Result, Delay, NoStore).
 
 %% Forwarded by MAM message or just a message without body
-is_valid_message_children(false, _,     _    ) -> false;
-is_valid_message_children(_,     false, false) -> true;
+is_valid_message_children(false, _,     _,     _    ) -> false;
+is_valid_message_children(_,     false, false, false) -> true;
 %% Forwarded by MAM message or delivered by mod_offline
 %% See mam_SUITE:offline_message for a test case
-is_valid_message_children(_,      _,    _    ) -> false.
-
-
--ifdef(MAM_COMPACT_FORWARDED).
-
-%% @doc Forms a simple forwarded message (not according XEP).
-%%
-%% ```
-%% <message xmlns="jabber:client"
-%%    from="room@muc.server/alice"
-%%    to="bob@server/res1"
-%%    type="groupchat">
-%%  <body>1</body>
-%%  <delay xmlns="urn:xmpp:delay" id="9RUQN9VBP7G1" query_id="q1" stamp="2014-01-13T14:16:57Z" />
-%% </message>
-%% '''
--spec wrap_message(Packet :: jlib:xmlel(), QueryID :: binary(),
-                   MessageUID :: term(), DateTime :: calendar:datetime(),
-                   SrcJID :: ejabberd:jid()) -> Wrapper :: jlib:xmlel().
-wrap_message(Packet, QueryID, MessageUID, DateTime, SrcJID) ->
-    Delay = delay(DateTime, SrcJID, QueryID, MessageUID),
-    Packet2 = xml:append_subtags(Packet, [Delay]),
-    xml:replace_tag_attr(<<"from">>, jlib:jid_to_binary(SrcJID), Packet2).
-
-
--spec delay(DateTime :: calendar:datetime(), SrcJID :: ejabberd:jid(),
-            QueryId :: binary(), MessageUID :: binary()) -> jlib:xmlel().
-delay(DateTime, _SrcJID, QueryID, MessageUID) ->
-    jlib:timestamp_to_mam_xml(DateTime, utc, QueryID, MessageUID).
-
--else.
+is_valid_message_children(_,      _,    _,     _    ) -> false.
 
 %% @doc Forms `<forwarded/>' element, according to the XEP.
--spec wrap_message(Packet :: jlib:xmlel(), QueryID :: binary(),
+-spec wrap_message(MamNs :: binary(), Packet :: jlib:xmlel(), QueryID :: binary(),
                    MessageUID :: term(), DateTime :: calendar:datetime(),
                    SrcJID :: ejabberd:jid()) -> Wrapper :: jlib:xmlel().
-wrap_message(Packet, QueryID, MessageUID, DateTime, SrcJID) ->
+wrap_message(MamNs, Packet, QueryID, MessageUID, DateTime, SrcJID) ->
     #xmlel{
-        name = <<"message">>,
-        attrs = [],
-        children = [result(QueryID, MessageUID,
-                           [forwarded(Packet, DateTime, SrcJID)])]}.
+       name = <<"message">>,
+       attrs = [],
+       children = [result(MamNs, QueryID, MessageUID,
+                          [forwarded(Packet, DateTime, SrcJID)])]}.
 
 -spec forwarded(jlib:xmlel(), calendar:datetime(), ejabberd:jid())
-            -> jlib:xmlel().
+               -> jlib:xmlel().
 forwarded(Packet, DateTime, SrcJID) ->
     #xmlel{
-        name = <<"forwarded">>,
-        attrs = [{<<"xmlns">>, <<"urn:xmpp:forward:0">>}],
-        children = [delay(DateTime, SrcJID), Packet]}.
+       name = <<"forwarded">>,
+       attrs = [{<<"xmlns">>, <<"urn:xmpp:forward:0">>}],
+       %% Two places to include SrcJID:
+       %% - delay.from - optional XEP-0297 (TODO: depricate adding it?)
+       %% - message.from - required XEP-0313
+       %% Also, mod_mam_muc will replace it again with SrcJID
+       children = [delay(DateTime, SrcJID), replace_from_attribute(SrcJID, Packet)]}.
 
 -spec delay(calendar:datetime(), ejabberd:jid()) -> jlib:xmlel().
 delay(DateTime, SrcJID) ->
     jlib:timestamp_to_xml(DateTime, utc, SrcJID, <<>>).
 
+replace_from_attribute(From, Packet=#xmlel{attrs = Attrs}) ->
+    Attrs1 = lists:keydelete(<<"from">>, 1, Attrs),
+    Attrs2 = [{<<"from">>, jid:to_binary(From)} | Attrs1],
+    Packet#xmlel{attrs = Attrs2}.
 
 %% @doc Generates tag `<result />'.
 %% This element will be added in each forwarded message.
--spec result(_, MessageUID :: binary(), Children :: [jlib:xmlel(),...])
+-spec result(binary(), _, MessageUID :: binary(), Children :: [jlib:xmlel(), ...])
             -> jlib:xmlel().
-result(QueryID, MessageUID, Children) when is_list(Children) ->
+result(MamNs, QueryID, MessageUID, Children) when is_list(Children) ->
     %% <result xmlns='urn:xmpp:mam:tmp' queryid='f27' id='28482-98726-73623' />
     #xmlel{
-        name = <<"result">>,
-        attrs = [{<<"queryid">>, QueryID} || QueryID =/= undefined, QueryID =/= <<>>] ++
-                [{<<"xmlns">>, mam_ns_binary()},
-                 {<<"id">>, MessageUID}],
-        children = Children}.
-
--endif.
+       name = <<"result">>,
+       attrs = [{<<"queryid">>, QueryID} || QueryID =/= undefined, QueryID =/= <<>>] ++
+           [{<<"xmlns">>, MamNs},
+            {<<"id">>, MessageUID}],
+       children = Children}.
 
 
 %% @doc Generates `<set />' tag.
@@ -353,11 +392,11 @@ result(QueryID, MessageUID, Children) when is_list(Children) ->
 %% This element will be added into "iq/query".
 %% @end
 -spec result_set(FirstId :: binary() | undefined,
-        LastId :: binary() | undefined,
-        FirstIndexI :: non_neg_integer() | undefined,
-        CountI :: non_neg_integer() | undefined) -> jlib:xmlel().
+                 LastId :: binary() | undefined,
+                 FirstIndexI :: non_neg_integer() | undefined,
+                 CountI :: non_neg_integer() | undefined) -> jlib:xmlel().
 result_set(FirstId, LastId, undefined, undefined)
-    when ?MAYBE_BIN(FirstId), ?MAYBE_BIN(LastId) ->
+  when ?MAYBE_BIN(FirstId), ?MAYBE_BIN(LastId) ->
     %% Simple response
     FirstEl = [#xmlel{name = <<"first">>,
                       children = [#xmlcdata{content = FirstId}]
@@ -366,13 +405,13 @@ result_set(FirstId, LastId, undefined, undefined)
     LastEl = [#xmlel{name = <<"last">>,
                      children = [#xmlcdata{content = LastId}]
                     }
-               || LastId =/= undefined],
-     #xmlel{
-        name = <<"set">>,
-        attrs = [{<<"xmlns">>, rsm_ns_binary()}],
-        children = FirstEl ++ LastEl};
+              || LastId =/= undefined],
+    #xmlel{
+       name = <<"set">>,
+       attrs = [{<<"xmlns">>, rsm_ns_binary()}],
+       children = FirstEl ++ LastEl};
 result_set(FirstId, LastId, FirstIndexI, CountI)
-    when ?MAYBE_BIN(FirstId), ?MAYBE_BIN(LastId) ->
+  when ?MAYBE_BIN(FirstId), ?MAYBE_BIN(LastId) ->
     FirstEl = [#xmlel{name = <<"first">>,
                       attrs = [{<<"index">>, integer_to_binary(FirstIndexI)}],
                       children = [#xmlcdata{content = FirstId}]
@@ -381,43 +420,72 @@ result_set(FirstId, LastId, FirstIndexI, CountI)
     LastEl = [#xmlel{name = <<"last">>,
                      children = [#xmlcdata{content = LastId}]
                     }
-               || LastId =/= undefined],
+              || LastId =/= undefined],
     CountEl = #xmlel{
-            name = <<"count">>,
-            children = [#xmlcdata{content = integer_to_binary(CountI)}]},
-     #xmlel{
-        name = <<"set">>,
-        attrs = [{<<"xmlns">>, rsm_ns_binary()}],
-        children = FirstEl ++ LastEl ++ [CountEl]}.
+                 name = <<"count">>,
+                 children = [#xmlcdata{content = integer_to_binary(CountI)}]},
+    #xmlel{
+       name = <<"set">>,
+       attrs = [{<<"xmlns">>, rsm_ns_binary()}],
+       children = FirstEl ++ LastEl ++ [CountEl]}.
 
 
--spec result_query(jlib:xmlcdata() | jlib:xmlel()) -> jlib:xmlel().
-result_query(SetEl) ->
-     #xmlel{
-        name = <<"query">>,
-        attrs = [{<<"xmlns">>, mam_ns_binary()}],
-        children = [SetEl]}.
+-spec result_query(jlib:xmlcdata() | jlib:xmlel(), binary()) -> jlib:xmlel().
+result_query(SetEl, Namespace) ->
+    #xmlel{
+       name = <<"query">>,
+       attrs = [{<<"xmlns">>, Namespace}],
+       children = [SetEl]}.
 
 -spec result_prefs(DefaultMode :: archive_behaviour(),
-                   AlwaysJIDs :: [mod_mam:literal_jid()],
-                   NeverJIDs :: [mod_mam:literal_jid()]) -> jlib:xmlel().
-result_prefs(DefaultMode, AlwaysJIDs, NeverJIDs) ->
+                   AlwaysJIDs :: [ejabberd:literal_jid()],
+                   NeverJIDs :: [ejabberd:literal_jid()],
+                   Namespace :: binary()) -> jlib:xmlel().
+result_prefs(DefaultMode, AlwaysJIDs, NeverJIDs, Namespace) ->
     AlwaysEl = #xmlel{name = <<"always">>,
                       children = encode_jids(AlwaysJIDs)},
     NeverEl  = #xmlel{name = <<"never">>,
                       children = encode_jids(NeverJIDs)},
     #xmlel{
        name = <<"prefs">>,
-       attrs = [{<<"xmlns">>,mam_ns_binary()},
+       attrs = [{<<"xmlns">>, Namespace},
                 {<<"default">>, atom_to_binary(DefaultMode, utf8)}],
        children = [AlwaysEl, NeverEl]
-    }.
+      }.
 
 
 -spec encode_jids([binary() | string()]) -> [jlib:xmlel()].
 encode_jids(JIDs) ->
     [#xmlel{name = <<"jid">>, children = [#xmlcdata{content = JID}]}
      || JID <- JIDs].
+
+
+%% Make fin message introduced in MAM 0.3
+-spec make_fin_message(binary(), boolean(), boolean(), jlib:xmlel(), binary()) -> jlib:xmlel().
+make_fin_message(MamNs, IsComplete, IsStable, ResultSetEl, QueryID) ->
+    #xmlel{
+       name = <<"message">>,
+       children = [make_fin_element_v03(MamNs, IsComplete, IsStable, ResultSetEl, QueryID)]}.
+
+%% MAM v0.3
+make_fin_element_v03(MamNs, IsComplete, IsStable, ResultSetEl, QueryID) ->
+    #xmlel{
+       name = <<"fin">>,
+       attrs = [{<<"xmlns">>, MamNs}]
+        ++ [{<<"complete">>, <<"true">>} || IsComplete]
+        ++ [{<<"stable">>, <<"false">>} || not IsStable]
+        ++ [{<<"queryid">>, QueryID} || is_binary(QueryID), QueryID =/= undefined],
+       children = [ResultSetEl]}.
+
+%% MAM v0.4.1 and above
+-spec make_fin_element(binary(), boolean(), boolean(), jlib:xmlel()) -> jlib:xmlel().
+make_fin_element(MamNs, IsComplete, IsStable, ResultSetEl) ->
+    #xmlel{
+       name = <<"fin">>,
+       attrs = [{<<"xmlns">>, MamNs}]
+        ++ [{<<"complete">>, <<"true">>} || IsComplete]
+        ++ [{<<"stable">>, <<"false">>} || not IsStable],
+       children = [ResultSetEl]}.
 
 
 -spec parse_prefs(PrefsEl :: jlib:xmlel()) -> mod_mam:preference().
@@ -434,13 +502,15 @@ valid_behavior(<<"never">>)  -> never;
 valid_behavior(<<"roster">>) -> roster.
 
 
--spec parse_jid_list(jlib:xmlel(), binary()) -> [mod_mam:literal_jid()].
+-spec parse_jid_list(jlib:xmlel(), binary()) -> [ejabberd:literal_jid()].
 parse_jid_list(El, Name) ->
     case xml:get_subtag(El, Name) of
         false -> [];
         #xmlel{children = JIDEls} ->
             %% Ignore cdata between jid elements
-            [xml:get_tag_cdata(JIDEl) || JIDEl <- JIDEls, is_jid_element(JIDEl)]
+            MaybeJids = [binary_jid_to_lower(xml:get_tag_cdata(JIDEl))
+                         || JIDEl <- JIDEls, is_jid_element(JIDEl)],
+            skip_bad_jids(MaybeJids)
     end.
 
 is_jid_element(#xmlel{name = <<"jid">>}) ->
@@ -448,12 +518,33 @@ is_jid_element(#xmlel{name = <<"jid">>}) ->
 is_jid_element(_) -> %% ignore cdata
     false.
 
+%% @doc Normalize JID to be used when comparing JIDs in DB
+binary_jid_to_lower(BinJid) when is_binary(BinJid) ->
+    Jid = jid:from_binary(BinJid),
+    case jid:to_lower(Jid) of
+        error ->
+            error;
+        LowerJid ->
+            jid:to_binary(LowerJid)
+    end.
+
+skip_bad_jids(MaybeJids) ->
+    [Jid || Jid <- MaybeJids, is_binary(Jid)].
+
 -spec borders_decode(jlib:xmlel()) -> 'undefined' | mod_mam:borders().
 borders_decode(QueryEl) ->
     AfterID  = tag_id(QueryEl, <<"after_id">>),
     BeforeID = tag_id(QueryEl, <<"before_id">>),
     FromID   = tag_id(QueryEl, <<"from_id">>),
     ToID     = tag_id(QueryEl, <<"to_id">>),
+    borders(AfterID, BeforeID, FromID, ToID).
+
+-spec form_borders_decode(jlib:xmlel()) -> 'undefined' | mod_mam:borders().
+form_borders_decode(QueryEl) ->
+    AfterID  = form_field_mess_id(QueryEl, <<"after_id">>),
+    BeforeID = form_field_mess_id(QueryEl, <<"before_id">>),
+    FromID   = form_field_mess_id(QueryEl, <<"from_id">>),
+    ToID     = form_field_mess_id(QueryEl, <<"to_id">>),
     borders(AfterID, BeforeID, FromID, ToID).
 
 
@@ -478,6 +569,10 @@ tag_id(QueryEl, Name) ->
     BExtMessID = xml:get_tag_attr_s(Name, QueryEl),
     maybe_external_binary_to_mess_id(BExtMessID).
 
+-spec form_field_mess_id(jlib:xmlel(), binary()) -> 'undefined' | integer().
+form_field_mess_id(QueryEl, Name) ->
+    BExtMessID = form_field_value_s(QueryEl, Name),
+    maybe_external_binary_to_mess_id(BExtMessID).
 
 -spec decode_optimizations(jlib:xmlel()) -> 'false' | 'opt_count' | 'true'.
 decode_optimizations(QueryEl) ->
@@ -488,12 +583,156 @@ decode_optimizations(QueryEl) ->
         _              -> true
     end.
 
+-spec form_decode_optimizations(jlib:xmlel()) -> false | opt_count | true.
+form_decode_optimizations(QueryEl) ->
+    case {form_field_value(QueryEl, <<"simple">>),
+          form_field_value(QueryEl, <<"opt_count">>)} of
+        {_, <<"true">>}     -> opt_count;
+        {<<"true">>, _}     -> true;
+        {_, _}              -> false
+    end.
+
+
+is_mam_result_message(Packet = #xmlel{name = <<"message">>}) ->
+    Ns = maybe_get_result_namespace(Packet),
+    is_mam_namespace(Ns);
+is_mam_result_message(_) ->
+    false.
+
+maybe_get_result_namespace(Packet) ->
+    xml:get_path_s(Packet, [{elem, <<"result">>}, {attr, <<"xmlns">>}]).
+
+is_mam_namespace(?NS_MAM)    -> true;
+is_mam_namespace(?NS_MAM_03) -> true;
+is_mam_namespace(?NS_MAM_04) -> true;
+is_mam_namespace(_)          -> false.
+
+
+%% -----------------------------------------------------------------------
+%% Forms
+
+-spec form_field_value(jlib:xmlel(), binary()) -> undefined | binary().
+form_field_value(QueryEl, Name) ->
+    case xml:get_subtag(QueryEl, <<"x">>) of
+        false ->
+            undefined;
+        #xmlel{children=Fields} -> %% <x xmlns='jabber:x:data'/>
+            case find_field(Fields, Name) of
+                undefined ->
+                    undefined;
+                Field ->
+                    field_to_value(Field)
+            end
+    end.
+
+form_field_value_s(QueryEl, Name) ->
+    undefined_to_empty(form_field_value(QueryEl, Name)).
+
+undefined_to_empty(undefined) -> <<>>;
+undefined_to_empty(X)         -> X.
+
+%% @doc Return first matched field
+-spec find_field(list(jlib:xmlel()), binary()) -> undefined | jlib:xmlel().
+find_field([#xmlel{name = <<"field">>, attrs = Attrs}=Field|Fields], Name) ->
+    case xml:get_attr(<<"var">>, Attrs) of
+        {value, Name} ->
+            Field;
+        _ ->
+            find_field(Fields, Name)
+    end;
+find_field([_|Fields], Name) -> %% skip whitespaces
+    find_field(Fields, Name);
+find_field([], _Name) ->
+    undefined.
+
+-spec field_to_value(jlib:xmlel()) -> binary().
+field_to_value(FieldEl) ->
+    xml:get_path_s(FieldEl, [{elem, <<"value">>}, cdata]).
+
+-spec message_form(Mod :: mod_mam | mod_mam_muc, Host :: ejabberd:lserver(), binary()) ->
+    jlib:xmlel().
+message_form(Module, Host, MamNs) ->
+    SubEl = #xmlel{name = <<"x">>,
+                   attrs = [{<<"xmlns">>, <<"jabber:x:data">>},
+                            {<<"type">>, <<"form">>}],
+                   children = message_form_fields(Module, Host, MamNs)},
+    result_query(SubEl, MamNs).
+
+message_form_fields(Mod, Host, MamNs) ->
+    TextSearch =
+        case has_full_text_search(Mod, Host) of
+            true -> [form_field(<<"text-single">>, <<"full-text-search">>)];
+            false -> []
+        end,
+    [form_type_field(MamNs),
+     form_field(<<"jid-single">>, <<"with">>),
+     form_field(<<"text-single">>, <<"start">>),
+     form_field(<<"text-single">>, <<"end">>) | TextSearch].
+
+form_type_field(MamNs) when is_binary(MamNs) ->
+    #xmlel{name = <<"field">>,
+           attrs = [{<<"type">>, <<"hidden">>},
+                    {<<"var">>, <<"FORM_TYPE">>}],
+           children = [#xmlel{name = <<"value">>,
+                              children = [#xmlcdata{content = MamNs}]}]}.
+
+form_field(Type, VarName) ->
+    #xmlel{name = <<"field">>,
+           attrs = [{<<"type">>, Type},
+                    {<<"var">>, VarName}]}.
+
+-spec form_to_text(_) -> 'undefined' | binary().
+form_to_text(El) ->
+    form_field_value(El, <<"full-text-search">>).
+
+%% -----------------------------------------------------------------------
+%% Text search tokenization
+%% -----------------------------------------------------------------------
+
+%% -----------------------------------------------------------------------
+%% @doc
+%% Normalize given text to improve text search in some MAM backends.
+%% This normalization involves making text all lowercase, replacing some word separators
+%% ([, .:;-?!]) with given one (by default "%") and removing all unicode characters that are
+%% considered non-alphanumerical.
+%% For example, text: "My cat, was eaten by: my dog?!? Why...?!?" will be normalized as:
+%% "my%cat%was%eaten%by%my%dog%why"
+%% @end
+%% -----------------------------------------------------------------------
+-spec normalize_search_text(binary() | string() | undefined) -> string() | undefined.
+normalize_search_text(Text) ->
+    normalize_search_text(Text, "%").
+
+-spec normalize_search_text(binary() | string() | undefined, string()) -> string() | undefined.
+normalize_search_text(undefined, _WordSeparator) ->
+    undefined;
+normalize_search_text(Text, WordSeparator) ->
+    BodyString = unicode:characters_to_list(Text),
+    LowerBody = string:to_lower(BodyString),
+    ReOpts = [{return, list}, global, unicode, ucp],
+    Re0 = re:replace(LowerBody, "[, .:;-?!]+", " ", ReOpts),
+    Re1 = re:replace(Re0, "([^\\w ]+)|(^\\s+)|(\\s+$)", "", ReOpts),
+    re:replace(Re1, "\s+", WordSeparator, ReOpts).
+
+-spec packet_to_search_body(Module :: mod_mam | mod_mam_muc, Host :: ejabberd:server(),
+                            Packet :: xmlel()) -> string().
+packet_to_search_body(Module, Host, Packet) ->
+    case has_full_text_search(Module, Host) of
+        true ->
+            BodyValue = xml:get_tag_cdata(xml:get_subtag(Packet, <<"body">>)),
+            mod_mam_utils:normalize_search_text(BodyValue, " ");
+        false -> ""
+    end.
+
+-spec has_full_text_search(Module :: mod_mam | mod_mam_muc, Host :: ejabberd:server()) -> boolean().
+has_full_text_search(Module, Host) ->
+    gen_mod:get_module_opt(Host, Module, full_text_search, true).
 
 %% -----------------------------------------------------------------------
 %% JID serialization
 
 -spec jid_to_opt_binary(UserJID :: ejabberd:jid(), JID :: ejabberd:jid()
-                        ) -> mod_mam:literal_jid().
+                        ) -> ejabberd:literal_jid().
 jid_to_opt_binary(#jid{lserver=LServer, luser=LUser},
                   #jid{lserver=LServer, luser=LUser, lresource= <<>>}) ->
     <<>>;
@@ -517,20 +756,20 @@ jid_to_opt_binary(_,
 
 
 -spec expand_minified_jid(UserJID :: ejabberd:jid(),
-                    OptJID :: mod_mam:literal_jid()) -> mod_mam:literal_jid().
+                          OptJID :: ejabberd:literal_jid()) -> ejabberd:literal_jid().
 expand_minified_jid(#jid{lserver=LServer, luser=LUser}, <<>>) ->
     <<LUser/binary, $@, LServer/binary>>;
 expand_minified_jid(#jid{lserver=LServer, luser=LUser}, <<$/, LResource/binary>>) ->
     <<LUser/binary, $@, LServer/binary, $/, LResource/binary>>;
 expand_minified_jid(UserJID, Encoded) ->
     Part = binary:match(Encoded, [<<$@>>, <<$/>>, <<$:>>]),
-    expand_minified_jid_2(Part, UserJID, Encoded).
+    expand_minified_jid(Part, UserJID, Encoded).
 
--spec expand_minified_jid_2('nomatch' | {non_neg_integer(),1},
+-spec expand_minified_jid('nomatch' | {non_neg_integer(), 1},
             ejabberd:jid(), Encoded :: ejabberd:luser() | binary()) -> binary().
-expand_minified_jid_2(nomatch,  #jid{lserver=ThisServer}, LUser) ->
+expand_minified_jid(nomatch,  #jid{lserver=ThisServer}, LUser) ->
     <<LUser/binary, $@, ThisServer/binary>>;
-expand_minified_jid_2({Pos, 1}, #jid{lserver=ThisServer}, Encoded) ->
+expand_minified_jid({Pos, 1}, #jid{lserver=ThisServer}, Encoded) ->
     case Encoded of
         <<LServer:Pos/binary, $:, LUser/binary>> ->
             <<LUser/binary, $@, LServer/binary>>;
@@ -545,10 +784,10 @@ expand_minified_jid_2({Pos, 1}, #jid{lserver=ThisServer}, Encoded) ->
 
 jid_to_opt_binary_test_() ->
     check_stringprep(),
-    UserJID = jlib:binary_to_jid(<<"alice@room">>),
+    UserJID = jid:from_binary(<<"alice@room">>),
     [?_assertEqual(JID,
-        expand_minified_jid(UserJID,
-            jid_to_opt_binary(UserJID, jlib:binary_to_jid(JID))))
+        (expand_minified_jid(UserJID,
+              jid_to_opt_binary(UserJID, jid:from_binary(JID)))))
      || JID <- test_jids()].
 
 test_jids() ->
@@ -561,12 +800,12 @@ test_jids() ->
      <<"bob@street/mobile">>].
 
 check_stringprep() ->
-    is_loaded_application(p1_stringprep) orelse start_stringprep().
+    is_loaded_application(stringprep) orelse start_stringprep().
 
 start_stringprep() ->
     EJ = code:lib_dir(ejabberd),
-    code:add_path(filename:join([EJ, "..", "..", "deps", "p1_stringprep", "ebin"])),
-    ok = application:start(p1_stringprep).
+    code:add_path(filename:join([EJ, "..", "..", "deps", "stringprep", "ebin"])),
+    ok = application:start(stringprep).
 
 is_loaded_application(AppName) when is_atom(AppName) ->
     lists:keymember(AppName, 1, application:loaded_applications()).
@@ -579,33 +818,25 @@ is_loaded_application(AppName) when is_atom(AppName) ->
 -spec maybe_integer(binary(), Default :: integer()) -> integer().
 maybe_integer(<<>>, Def) -> Def;
 maybe_integer(Bin, _Def) when is_binary(Bin) ->
-    list_to_integer(binary_to_list(Bin)).
+    binary_to_integer(Bin).
 
-
--spec is_function_exist(atom() | {module(), _}, F :: atom(), A :: integer()
-                       ) -> boolean().
-is_function_exist({M, _}, F, A) ->
-    %% M is a tuple module
-    is_function_exist(M, F, A+1);
-is_function_exist(M, F, A) ->
-    lists:member({F, A}, M:module_info(exports)).
-
-
--spec apply_start_border('undefined' | mod_mam:borders(), integer()) -> integer().
+-spec apply_start_border('undefined' | mod_mam:borders(), undefined | integer()) ->
+                                undefined | integer().
 apply_start_border(undefined, StartID) ->
     StartID;
 apply_start_border(#mam_borders{after_id=AfterID, from_id=FromID}, StartID) ->
     maybe_max(maybe_next_id(AfterID), maybe_max(FromID, StartID)).
 
 
--spec apply_end_border('undefined' | mod_mam:borders(), integer()) -> integer().
+-spec apply_end_border('undefined' | mod_mam:borders(), undefined | integer()) ->
+                              undefined | integer().
 apply_end_border(undefined, EndID) ->
     EndID;
 apply_end_border(#mam_borders{before_id=BeforeID, to_id=ToID}, EndID) ->
     maybe_min(maybe_previous_id(BeforeID), maybe_min(ToID, EndID)).
 
 
--spec maybe_min('undefined' | integer(), integer()) -> integer().
+-spec maybe_min('undefined' | integer(), undefined | integer()) -> integer().
 maybe_min(undefined, Y) ->
     Y;
 maybe_min(X, undefined) ->
@@ -614,7 +845,7 @@ maybe_min(X, Y) ->
     min(X, Y).
 
 
--spec maybe_max('undefined' | integer(), integer()) -> integer().
+-spec maybe_max('undefined' | integer(), undefined | integer()) -> integer().
 maybe_max(undefined, Y) ->
     Y;
 maybe_max(X, undefined) ->
@@ -636,17 +867,38 @@ maybe_previous_id(X) ->
     X - 1.
 
 
+-spec is_last_page(PageSize, TotalCount, Offset, MessageRows) -> boolean() when
+    PageSize    :: non_neg_integer(),
+    TotalCount  :: non_neg_integer()|undefined,
+    Offset      :: non_neg_integer()|undefined,
+    MessageRows :: list().
+is_last_page(PageSize, _TotalCount, _Offset, MessageRows)
+    when length(MessageRows) < PageSize ->
+    true;
+is_last_page(PageSize, TotalCount, Offset, MessageRows)
+  when is_integer(TotalCount), is_integer(Offset),
+       length(MessageRows) =:= PageSize ->
+    %% Number of messages on skipped pages from the beginning plus the current page
+    PagedCount = Offset + PageSize,
+    TotalCount =:= PagedCount; %% false means full page but not the last one in the result set
+is_last_page(_PageSize, _TotalCount, _Offset, _MessageRows) ->
+    %% When is_integer(TotalCount), is_integer(Offset)
+    %%     it's not possible case: the page is bigger then page size.
+    %% Otherwise either TotalCount or Offset is undefined because of optimizations.
+    false.
+
+
 %% -----------------------------------------------------------------------
 %% Ejabberd
 
 -spec send_message(ejabberd:jid(), ejabberd:jid(), jlib:xmlel()
-                  ) -> 'ok' | {'error','lager_not_running'}.
+                  ) -> 'ok' | {'error', 'lager_not_running'}.
 
 -ifdef(MAM_COMPACT_FORWARDED).
 
 send_message(_From, To, Mess) ->
     {value, BFrom} = xml:get_tag_attr(<<"from">>, Mess),
-    From = jlib:binary_to_jid(BFrom),
+    From = jid:from_binary(BFrom),
     ejabberd_sm:route(From, To, Mess).
 
 -else.
@@ -660,22 +912,26 @@ send_message(From, To, Mess) ->
 -spec is_jid_in_user_roster(ejabberd:jid(), ejabberd:jid()) -> boolean().
 is_jid_in_user_roster(#jid{lserver=LServer, luser=LUser},
                       #jid{} = RemJID) ->
-    RemBareJID = jlib:jid_remove_resource(RemJID),
+    RemBareJID = jid:to_bare(RemJID),
     {Subscription, _Groups} =
-    ejabberd_hooks:run_fold(
-        roster_get_jid_info, LServer,
-        {none, []}, [LUser, LServer, RemBareJID]),
+        ejabberd_hooks:run_fold(
+          roster_get_jid_info, LServer,
+          {none, []}, [LUser, LServer, RemBareJID]),
     Subscription == from orelse Subscription == both.
 
 
--spec success_sql_query(ejabberd:server(), _) -> any().
-success_sql_query(Host, Query) ->
-    case ejabberd_odbc:sql_query(Host, Query) of
-        {error, Reason} ->
-            ?ERROR_MSG("SQL-error on ~p.~nQuery ~p~nReason ~p~n",
-                       [Host, Query, Reason]),
-            error(sql_error);
-        Result ->
-            Result
-    end.
+-spec success_sql_query(atom() | ejabberd:server(), _) -> any().
+success_sql_query(HostOrConn, Query) ->
+    Result = mongoose_rdbms:sql_query(HostOrConn, Query),
+    error_on_sql_error(HostOrConn, Query, Result).
 
+-spec success_sql_execute(atom() | ejabberd:server(), atom(), [term()]) -> any().
+success_sql_execute(HostOrConn, Name, Params) ->
+    Result = mongoose_rdbms:execute(HostOrConn, Name, Params),
+    error_on_sql_error(HostOrConn, Name, Result).
+
+error_on_sql_error(HostOrConn, Query, {error, Reason}) ->
+    ?ERROR_MSG("SQL-error on ~p.~nQuery ~p~nReason ~p", [HostOrConn, Query, Reason]),
+    error({sql_error, Reason});
+error_on_sql_error(_HostOrConn, _Query, Result) ->
+    Result.

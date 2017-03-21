@@ -35,7 +35,8 @@
          start/2,
          stop/1,
          check_access_log/2,
-         add_to_log/5]).
+         add_to_log/5,
+         set_room_occupants/4]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -60,18 +61,23 @@
 
 -type jid_nick_role() :: {ejabberd:jid(), mod_muc:nick(), mod_muc:role()}.
 -type jid_nick() :: {ejabberd:jid(), mod_muc:nick()}.
+-type dir_type() :: 'plain' | 'subdirs'.
+-type dir_name() :: 'room_jid' | 'room_name'.
+-type file_format() :: 'html' | 'plaintext'.
 
 -record(logstate, {host         :: ejabberd:server(),
-                   out_dir      :: file:filename(),
-                   dir_type,
-                   dir_name     :: file:filename(),
-                   file_format,
-                   css_file     :: file:filename(),
+                   out_dir      :: binary(),
+                   dir_type     :: dir_type(),
+                   dir_name     :: dir_name(),
+                   file_format  :: file_format(),
+                   css_file     :: file:filename() | false,
                    access,
                    lang         :: ejabberd:lang(),
                    timezone,
                    spam_prevention,
-                   top_link
+                   top_link,
+                   occupants = #{} :: #{RoomJID :: binary() => [jid_nick_role()]},
+                   room_monitors = #{} :: #{reference() => RoomJID :: binary()}
                 }).
 -type logstate() :: #logstate{}.
 
@@ -80,15 +86,15 @@
 %%====================================================================
 
 %% @doc Starts the server
--spec start_link(ejabberd:server(),_) -> 'ignore' | {'error',_} | {'ok',pid()}.
+-spec start_link(ejabberd:server(), _) -> 'ignore' | {'error', _} | {'ok', pid()}.
 start_link(Host, Opts) ->
     Proc = gen_mod:get_module_proc(Host, ?PROCNAME),
     gen_server:start_link({local, Proc}, ?MODULE, [Host, Opts], []).
 
 
--spec start(ejabberd:server(),_) -> {'error',_}
-                                  | {'ok','undefined' | pid()}
-                                  | {'ok','undefined' | pid(),_}.
+-spec start(ejabberd:server(), _) -> {'error', _}
+                                  | {'ok', 'undefined' | pid()}
+                                  | {'ok', 'undefined' | pid(), _}.
 start(Host, Opts) ->
     Proc = gen_mod:get_module_proc(Host, ?PROCNAME),
     ChildSpec =
@@ -102,7 +108,7 @@ start(Host, Opts) ->
 
 
 -spec stop(ejabberd:server()) -> 'ok'
-    | {'error','not_found' | 'restarting' | 'running' | 'simple_one_for_one'}.
+    | {'error', 'not_found' | 'restarting' | 'running' | 'simple_one_for_one'}.
 stop(Host) ->
     Proc = gen_mod:get_module_proc(Host, ?PROCNAME),
     gen_server:call(Proc, stop),
@@ -126,6 +132,11 @@ check_access_log(Host, From) ->
             Res
     end.
 
+-spec set_room_occupants(ejabberd:server(), RoomPID :: pid(), RoomJID :: ejabberd:jid(),
+                         Occupants :: [mod_muc_room:user()]) -> ok.
+set_room_occupants(Host, RoomPID, RoomJID, Occupants) ->
+    gen_server:cast(get_proc_name(Host), {set_room_occupants, RoomPID, RoomJID, Occupants}).
+
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
@@ -137,7 +148,7 @@ check_access_log(Host, From) ->
 %%                         {stop, Reason}
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
--spec init([list() | ejabberd:server(),...]) -> {'ok',logstate()}.
+-spec init([list() | ejabberd:server(), ...]) -> {'ok', logstate()}.
 init([Host, Opts]) ->
     OutDir = list_to_binary(gen_mod:get_opt(outdir, Opts, "www/muc")),
     DirType = gen_mod:get_opt(dirtype, Opts, subdirs),
@@ -149,14 +160,14 @@ init([Host, Opts]) ->
     {TL1, TL2} = gen_mod:get_opt(top_link, Opts, {"/", "Home"}),
     Top_link = {list_to_binary(TL1), list_to_binary(TL2)},
     NoFollow = gen_mod:get_opt(spam_prevention, Opts, true),
-    Lang = list_to_binary(case ejabberd_config:get_local_option({language, Host}) of
+    Lang = case ejabberd_config:get_local_option({language, Host}) of
                undefined ->
                        case ejabberd_config:get_global_option(language) of
-                           undefined -> "en";
+                           undefined -> <<"en">>;
                            L -> L
                        end;
                L -> L
-           end),
+           end,
     {ok, #logstate{host = Host,
                 out_dir = OutDir,
                 dir_type = DirType,
@@ -179,9 +190,9 @@ init([Host, Opts]) ->
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
 -spec handle_call('stop'
-            | {'check_access_log','global' | ejabberd:server(), ejabberd:jid()},
-        From :: any(), logstate()) -> {'reply','allow' | 'deny',logstate()}
-                                    | {'stop','normal','ok',_}.
+            | {'check_access_log', 'global' | ejabberd:server(), ejabberd:jid()},
+        From :: any(), logstate()) -> {'reply', 'allow' | 'deny', logstate()}
+                                    | {'stop', 'normal', 'ok', _}.
 handle_call({check_access_log, ServerHost, FromJID}, _From, State) ->
     Reply = acl:match_rule(ServerHost, State#logstate.access, FromJID),
     {reply, Reply, State};
@@ -194,8 +205,10 @@ handle_call(stop, _From, State) ->
 %%                                      {stop, Reason, State}
 %% Description: Handling cast messages
 %%--------------------------------------------------------------------
--spec handle_cast({add_to_log, any(), any(), mod_muc:room(), list()}, logstate())
-            -> {'noreply', logstate()}.
+-spec handle_cast
+    ({add_to_log, any(), any(), mod_muc:room(), list()}, logstate()) -> {'noreply', logstate()};
+    ({set_room_occupants, pid(), ejabberd:jid(), [mod_muc_room:user()]}, logstate()) ->
+        {noreply, logstate()}.
 handle_cast({add_to_log, Type, Data, Room, Opts}, State) ->
     case catch add_to_log2(Type, Data, Room, Opts, State) of
         {'EXIT', Reason} ->
@@ -204,6 +217,19 @@ handle_cast({add_to_log, Type, Data, Room, Opts}, State) ->
             ok
     end,
     {noreply, State};
+handle_cast({set_room_occupants, RoomPID, RoomJID, Users}, State) ->
+    #logstate{occupants = OldOccupantsMap, room_monitors = OldMonitors} = State,
+    RoomJIDBin = jid:to_binary(RoomJID),
+    Monitors =
+        case maps:is_key(RoomJIDBin, OldOccupantsMap) of
+            true -> OldMonitors;
+            false ->
+                MonitorRef = monitor(process, RoomPID),
+                maps:put(MonitorRef, RoomJIDBin, OldMonitors)
+        end,
+    Occupants = [{U#user.jid, U#user.nick, U#user.role} || U <- Users],
+    OccupantsMap = maps:put(RoomJIDBin, Occupants, OldOccupantsMap),
+    {noreply, State#logstate{occupants = OccupantsMap, room_monitors = Monitors}};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -213,6 +239,17 @@ handle_cast(_Msg, State) ->
 %%                                       {stop, Reason, State}
 %% Description: Handling all non call/cast messages
 %%--------------------------------------------------------------------
+handle_info({'DOWN', MonitorRef, process, Pid, _Info}, State) ->
+    #logstate{occupants = OldOccupantsMap, room_monitors = OldMonitors} = State,
+    case maps:find(MonitorRef, OldMonitors) of
+        error ->
+            ?WARNING_MSG("Unknown monitored process ~p is now down", [Pid]),
+            {noreply, State};
+        {ok, RoomJID} ->
+            Monitors = maps:remove(MonitorRef, OldMonitors),
+            OccupantsMap = maps:remove(RoomJID, OldOccupantsMap),
+            {noreply, State#logstate{occupants = OccupantsMap, room_monitors = Monitors}}
+    end;
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -271,12 +308,9 @@ add_to_log2(kickban, {Nick, Reason, Code}, Room, Opts, State) ->
 %%----------------------------------------------------------------------
 %% Core
 
--type dir_type() :: 'plain' | 'subdirs'.
--type dir_name() :: 'room_jid' | 'room_name'.
--type file_format() :: 'html' | 'plaintext'.
--spec build_filename_string(calendar:datetime(), OutDir :: file:filename(),
+-spec build_filename_string(calendar:datetime(), OutDir :: binary(),
         RoomJID :: ejabberd:literal_jid(), dir_type(), dir_name(), file_format())
-            -> {file:filename(), file:filename(), file:filename()}.
+            -> {binary(), binary(), binary()}.
 build_filename_string(TimeStamp, OutDir, RoomJID, DirType, DirName, FileFormat) ->
     {{Year, Month, Day}, _Time} = TimeStamp,
 
@@ -311,7 +345,7 @@ build_filename_string(TimeStamp, OutDir, RoomJID, DirType, DirName, FileFormat) 
 
 -spec get_room_name(ejabberd:literal_jid()) -> mod_muc:room().
 get_room_name(RoomJID) ->
-    JID = jlib:binary_to_jid(RoomJID),
+    JID = jid:from_binary(RoomJID),
     JID#jid.user.
 
 
@@ -325,8 +359,7 @@ get_timestamp_daydiff(TimeStamp, Daydiff) ->
 
 
 %% @doc Try to close the previous day log, if it exists
--spec close_previous_log(file:filename(), any(), file_format())
-                                                    -> 'ok' | {'error',atom()}.
+-spec close_previous_log(binary(), any(), file_format()) -> 'ok' | {'error', atom()}.
 close_previous_log(Fn, Images_dir, FileFormat) ->
     case file:read_file_info(Fn) of
         {ok, _} ->
@@ -337,7 +370,7 @@ close_previous_log(Fn, Images_dir, FileFormat) ->
     end.
 
 
--spec write_last_lines(file:io_device(), file:filename(), file_format()) -> 'ok'.
+-spec write_last_lines(file:io_device(), binary(), file_format()) -> 'ok'.
 write_last_lines(_, _, plaintext) ->
     ok;
 write_last_lines(F, ImagesDir, _FileFormat) ->
@@ -350,8 +383,8 @@ write_last_lines(F, ImagesDir, _FileFormat) ->
     fw(F, <<"</span></div></body></html>">>).
 
 
--spec add_message_to_log(mod_muc:nick(), Message :: binary(),
-    RoomJID :: ejabberd:literal_jid(), Opts :: list(), State :: logstate()) -> ok.
+-spec add_message_to_log(mod_muc:nick(), Message :: atom() | tuple(),
+    RoomJID :: ejabberd:simple_jid() | ejabberd:jid(), Opts :: list(), State :: logstate()) -> ok.
 add_message_to_log(Nick1, Message, RoomJID, Opts, State) ->
     #logstate{out_dir = OutDir,
            dir_type = DirType,
@@ -361,10 +394,11 @@ add_message_to_log(Nick1, Message, RoomJID, Opts, State) ->
            lang = Lang,
            timezone = Timezone,
            spam_prevention = NoFollow,
-           top_link = TopLink} = State,
+           top_link = TopLink,
+           occupants = OccupantsMap} = State,
     Room = get_room_info(RoomJID, Opts),
     Nick = htmlize(Nick1, FileFormat),
-    Nick2 = htmlize(<<"<",Nick1/binary,">">>, FileFormat),
+    Nick2 = htmlize(<<"<", Nick1/binary, ">">>, FileFormat),
     Now = now(),
     TimeStamp = case Timezone of
                     local -> calendar:now_to_local_time(Now);
@@ -394,7 +428,7 @@ add_message_to_log(Nick1, Message, RoomJID, Opts, State) ->
 
             HourOffset = calc_hour_offset(TimeStamp),
             put_header(F, Room, Datestring, CSSFile, Lang,
-                       HourOffset, DatePrev, DateNext, TopLink, FileFormat),
+                       HourOffset, DatePrev, DateNext, TopLink, FileFormat, OccupantsMap),
 
             Images_dir = <<OutDir/binary, "images">>,
             file:make_dir(Images_dir),
@@ -424,17 +458,17 @@ add_message_to_log(Nick1, Message, RoomJID, Opts, State) ->
                        <<"<font class=\"mj\">", Nick/binary, " ", (?T(<<"leaves the room">>))/binary, "</font><br/>">>;
                {leave, Reason} ->
                        <<"<font class=\"ml\">", Nick/binary, " ", (?T(<<"leaves the room">>))/binary, ": ",
-                            (htmlize(Reason,NoFollow,FileFormat))/binary, ": ~s</font><br/>">>;
+                            (htmlize(Reason, NoFollow, FileFormat))/binary, ": ~s</font><br/>">>;
                {kickban, "301", ""} ->
                        <<"<font class=\"mb\">", Nick/binary, " ", (?T(<<"has been banned">>))/binary, "</font><br/>">>;
                {kickban, "301", Reason} ->
                        <<"<font class=\"mb\">", Nick/binary, " ", (?T(<<"has been banned">>))/binary, ": ",
-                            (htmlize(Reason,FileFormat))/binary, "</font><br/>">>;
+                            (htmlize(Reason, FileFormat))/binary, "</font><br/>">>;
                {kickban, "307", ""} ->
                        <<"<font class=\"mk\">", Nick/binary, " ", (?T(<<"has been kicked">>))/binary, "</font><br/>">>;
                {kickban, "307", Reason} ->
                        <<"<font class=\"mk\">", Nick/binary, " ", (?T(<<"has been kicked">>))/binary, ": ",
-                            (htmlize(Reason,FileFormat))/binary, "</font><br/>">>;
+                            (htmlize(Reason, FileFormat))/binary, "</font><br/>">>;
                {kickban, "321", ""} ->
                        <<"<font class=\"mk\">", Nick/binary, " ",
                             (?T(<<"has been kicked because of an affiliation change">>))/binary, "</font><br/>">>;
@@ -445,22 +479,22 @@ add_message_to_log(Nick1, Message, RoomJID, Opts, State) ->
                        <<"<font class=\"mk\">", Nick/binary, " ",
                             (?T(<<"has been kicked because of a system shutdown">>))/binary, "</font><br/>">>;
                {nickchange, OldNick} ->
-                       <<"<font class=\"mnc\">", (htmlize(OldNick,FileFormat))/binary, " ",
+                       <<"<font class=\"mnc\">", (htmlize(OldNick, FileFormat))/binary, " ",
                             (?T(<<"is now known as">>))/binary, " ", Nick/binary, "</font><br/>">>;
                {subject, T} ->
                       <<"<font class=\"msc\">", Nick/binary, (?T(<<" has set the subject to: ">>))/binary,
-                            (htmlize(T,NoFollow,FileFormat))/binary, "</font><br/>">>;
+                            (htmlize(T, NoFollow, FileFormat))/binary, "</font><br/>">>;
                {body, T} ->
                        case {re:run(T, <<"^/me\s">>, [{capture, none}]), Nick} of
                            {_, ""} ->
-                                   <<"<font class=\"msm\">", (htmlize(T,NoFollow,FileFormat))/binary, "</font><br/>">>;
+                                   <<"<font class=\"msm\">", (htmlize(T, NoFollow, FileFormat))/binary, "</font><br/>">>;
                            {match, _} ->
                        %% Delete "/me " from the beginning.
-                               <<_Pref:32, SubStr/binary>> = htmlize(T,FileFormat),
+                               <<_Pref:32, SubStr/binary>> = htmlize(T, FileFormat),
                                    <<"<font class=\"mne\">", Nick/binary, " ", SubStr/binary, "</font><br/>">>;
                            {nomatch, _} ->
                                    <<"<font class=\"mn\">", Nick2/binary, "</font> ",
-                                        (htmlize(T,NoFollow,FileFormat))/binary, "<br/>">>
+                                        (htmlize(T, NoFollow, FileFormat))/binary, "<br/>">>
                        end;
                {room_existence, RoomNewExistence} ->
                        <<"<font class=\"mrcm\">", (get_room_existence_string(RoomNewExistence, Lang))/binary, "</font><br/>">>
@@ -485,14 +519,14 @@ add_message_to_log(Nick1, Message, RoomJID, Opts, State) ->
 %% Utilities
 
 -spec get_room_existence_string('created' | 'destroyed' | 'started' | 'stopped',
-        ejabberd:lang()) -> string().
+        binary()) -> binary().
 get_room_existence_string(created, Lang) -> ?T(<<"Chatroom is created">>);
 get_room_existence_string(destroyed, Lang) -> ?T(<<"Chatroom is destroyed">>);
 get_room_existence_string(started, Lang) -> ?T(<<"Chatroom is started">>);
 get_room_existence_string(stopped, Lang) -> ?T(<<"Chatroom is stopped">>).
 
 
--spec get_dateweek(calendar:datetime(), ejabberd:lang()) -> binary().
+-spec get_dateweek(calendar:date(), binary()) -> binary().
 get_dateweek(Date, Lang) ->
     Weekday = case calendar:day_of_the_week(Date) of
                   1 -> ?T(<<"Monday">>);
@@ -528,7 +562,7 @@ get_dateweek(Date, Lang) ->
     end.
 
 
--spec make_dir_rec(file:name()) -> 'ok' | {'error',atom()}.
+-spec make_dir_rec(binary()) -> 'ok' | {'error', atom()}.
 make_dir_rec(Dir) ->
     case file:read_file_info(Dir) of
         {ok, _} ->
@@ -674,7 +708,7 @@ image_base64(<<"powered-by-ejabberd.png">>) ->
         "AElFTkSuQmCC">>.
 
 
--spec create_image_files(file:filename()) -> 'ok'.
+-spec create_image_files(<<_:8, _:_*8>>) -> 'ok'.
 create_image_files(Images_dir) ->
     Filenames = [<<"powered-by-ejabberd.png">>,
                  <<"powered-by-erlang.png">>,
@@ -709,13 +743,14 @@ fw(F, S, FileFormat) ->
     io:format(F, S2, []).
 
 
--spec put_header(file:io_device(), Room :: mod_muc:room(), Date :: binary(),
+-spec put_header(file:io_device(), Room :: #room{}, Date :: binary(),
         CSSFile :: boolean(), Lang :: ejabberd:lang(), Hour_offset :: integer(),
         Date_prev :: binary(), Date_next :: binary(), Top_link :: tuple(),
-        file_format()) -> 'ok'.
-put_header(_, _, _, _, _, _, _, _, _, plaintext) ->
+        file_format(), OccupantsMap :: #{binary() => [jid_nick_role()]}) -> 'ok'.
+put_header(_, _, _, _, _, _, _, _, _, plaintext, _) ->
     ok;
-put_header(F, Room, Date, CSSFile, Lang, Hour_offset, Date_prev, Date_next, Top_link, FileFormat) ->
+put_header(F, Room, Date, CSSFile, Lang, Hour_offset, Date_prev, Date_next, Top_link, FileFormat,
+           OccupantsMap) ->
     fw(F, <<"<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">">>),
     fw(F, <<"<html xmlns=\"http://www.w3.org/1999/xhtml\" xml:lang=\"", Lang/binary, "\" lang=\"", Lang/binary, "\">">>),
     fw(F, <<"<head>">>),
@@ -736,7 +771,7 @@ put_header(F, Room, Date, CSSFile, Lang, Hour_offset, Date_prev, Date_next, Top_
     end,
     RoomConfig = roomconfig_to_binary(Room#room.config, Lang, FileFormat),
     put_room_config(F, RoomConfig, Lang, FileFormat),
-    Occupants = get_room_occupants(Room#room.jid),
+    Occupants = maps:get(Room#room.jid, OccupantsMap, []),
     RoomOccupants = roomoccupants_to_binary(Occupants, FileFormat),
     put_room_occupants(F, RoomOccupants, Lang, FileFormat),
     Time_offset_bin = case Hour_offset<0 of
@@ -779,7 +814,8 @@ put_header_css(F, false) ->
     fw(F, <<".w3c {position: absolute; right: 10px; width: 60%; text-align: right; font-family: monospace; letter-spacing: 1px;}">>),
     fw(F, <<"//-->">>),
     fw(F, <<"</style>">>);
-put_header_css(F, CSSFile) ->
+put_header_css(F, CSSFileStr) ->
+    CSSFile = list_to_binary(CSSFileStr),
     fw(F, <<"<link rel=\"stylesheet\" type=\"text/css\" href=\"", CSSFile/binary, "\" media=\"all\">">>).
 
 put_header_script(F) ->
@@ -797,7 +833,7 @@ put_room_config(_F, _RoomConfig, _Lang, plaintext) ->
     ok;
 put_room_config(F, RoomConfig, Lang, _FileFormat) ->
     {Now1, Now2, Now3} = now(),
-    NowBin = list_to_binary(lists:flatten(io_lib:format("~p~p~p", [Now1,Now2,Now3]))),
+    NowBin = list_to_binary(lists:flatten(io_lib:format("~p~p~p", [Now1, Now2, Now3]))),
     fw(F, <<"<div class=\"rc\">">>),
     fw(F,   <<"<div class=\"rct\" onclick=\"sh('a", NowBin/binary, "');return false;\">", (?T(<<"Room Configuration">>))/binary, "</div>">>),
     fw(F,   <<"<div class=\"rcos\" id=\"a", NowBin/binary, "\" style=\"display: none;\" ><br/>", RoomConfig/binary, "</div>">>),
@@ -810,7 +846,7 @@ put_room_occupants(_F, _RoomOccupants, _Lang, plaintext) ->
     ok;
 put_room_occupants(F, RoomOccupants, Lang, _FileFormat) ->
     {Now1, Now2, Now3} = now(),
-    NowBin = list_to_binary(lists:flatten(io_lib:format("~p~p~p", [Now1,Now2,Now3]))),
+    NowBin = list_to_binary(lists:flatten(io_lib:format("~p~p~p", [Now1, Now2, Now3]))),
     fw(F, <<"<div class=\"rc\">">>),
     fw(F,   <<"<div class=\"rct\" onclick=\"sh('o", NowBin/binary, "');return false;\">", (?T(<<"Room Occupants">>))/binary, "</div>">>),
     fw(F,   <<"<div class=\"rcos\" id=\"o", NowBin/binary, "\" style=\"display: none;\" ><br/>", RoomOccupants/binary, "</div>">>),
@@ -857,7 +893,7 @@ htmlize2(S1, NoFollow) ->
          {<<"((http|https|ftp)://|(mailto|xmpp):)[^] )\'\"}]+">>, link_regexp(NoFollow)},
          {<<"  ">>, <<"\\&nbsp;\\&nbsp;">>},
          {<<"\\t">>, <<"\\&nbsp;\\&nbsp;\\&nbsp;\\&nbsp;">>},
-         {<<226,128,174>>, <<"[RLO]">>}],
+         {<<226, 128, 174>>, <<"[RLO]">>}],
     lists:foldl(fun({RegExp, Replace}, Acc) ->
                         re:replace(Acc, RegExp, Replace, [global, {return, binary}])
                 end, S1, ReplacementRules).
@@ -885,7 +921,7 @@ get_room_info(RoomJID, Opts) ->
             {value, {_, SA}} -> SA;
             false -> <<"">>
         end,
-    #room{jid = jlib:jid_to_binary(RoomJID),
+    #room{jid = RoomJID,
           title = Title,
           subject = Subject,
           subject_author = SubjectAuthor,
@@ -990,21 +1026,13 @@ group_by_role(Users) ->
         ++ case Ns of [] -> []; _ -> [{"None", Ns}] end.
 
 
-%% @doc Role = atom()
 %% Users = [{JID, Nick}]
--spec role_users_to_string(mod_muc:role(), [jid_nick()]) -> [string(),...].
+-spec role_users_to_string(string(), [jid_nick()]) -> [string(), ...].
 role_users_to_string(RoleS, Users) ->
     SortedUsers = lists:keysort(2, Users),
     UsersString = [[Nick, "<br/>"] || {_JID, Nick} <- SortedUsers],
     [RoleS, ": ", UsersString].
 
-
--spec get_room_occupants(ejabberd:literal_jid()) -> [jid_nick_role()].
-get_room_occupants(RoomJIDString) ->
-    RoomJID = jlib:binary_to_jid(RoomJIDString),
-    {ok, Users} = mod_muc_room:get_room_users(RoomJID),
-    [{U#user.jid, U#user.nick, U#user.role}
-     || U <- Users].
 
 get_proc_name(Host) -> gen_mod:get_module_proc(Host, ?PROCNAME).
 

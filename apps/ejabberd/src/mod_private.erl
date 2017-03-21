@@ -32,12 +32,13 @@
 -export([start/2,
          stop/1,
          process_sm_iq/3,
+         remove_user/3,
          remove_user/2]).
 
 -include("ejabberd.hrl").
 -include("jlib.hrl").
-
--define(BACKEND, (mod_private_backend:backend())).
+-xep([{xep, 49}, {version, "1.2"}]).
+-define(BACKEND, mod_private_backend).
 
 %% ------------------------------------------------------------------
 %% Backend callbacks
@@ -53,7 +54,7 @@
     NS      :: binary(),
     XML     :: #xmlel{},
     Reason  :: term(),
-    Result  :: {atomic, ok} | {aborted, Reason} | {error, Reason}.
+    Result  :: ok | {aborted, Reason} | {error, Reason}.
 
 -callback multi_get_data(LUser, LServer, NS2Def) -> [XML | Default] when
     LUser   :: binary(),
@@ -63,7 +64,7 @@
     Default :: term(),
     XML     :: #xmlel{}.
 
--callback remove_user(LUser, LServer) -> ok when
+-callback remove_user(LUser, LServer) -> any() when
     LUser   :: binary(),
     LServer :: binary().
 
@@ -71,7 +72,7 @@
 %% gen_mod callbacks
 
 start(Host, Opts) ->
-    gen_mod:start_backend_module(?MODULE, Opts),
+    gen_mod:start_backend_module(?MODULE, Opts, [multi_get_data, multi_set_data]),
     ?BACKEND:init(Host, Opts),
     IQDisc = gen_mod:get_opt(iqdisc, Opts, one_queue),
     ejabberd_hooks:add(remove_user, Host, ?MODULE, remove_user, 50),
@@ -88,9 +89,17 @@ stop(Host) ->
 %% ------------------------------------------------------------------
 %% Handlers
 
+
+%% #rh
+remove_user(Acc, User, Server) ->
+    case remove_user(User, Server) of
+        ok -> Acc;
+        E -> E
+    end.
+
 remove_user(User, Server) ->
-    LUser = jlib:nodeprep(User),
-    LServer = jlib:nameprep(Server),
+    LUser = jid:nodeprep(User),
+    LServer = jid:nameprep(Server),
     ?BACKEND:remove_user(LUser, LServer).
 
 process_sm_iq(
@@ -109,7 +118,7 @@ process_sm_iq(
             NS2XML = to_map(Elems),
             Result = ?BACKEND:multi_set_data(LUser, LServer, NS2XML),
             case Result of
-                {atomic, ok} ->
+                ok ->
                     IQ#iq{type = result, sub_el = [SubElem]};
                 {error, Reason} ->
                     ?ERROR_MSG("~p:multi_set_data failed ~p for ~ts@~ts.",

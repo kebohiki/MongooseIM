@@ -29,6 +29,8 @@
 
 -export([start_link/0, init/1, start/3,
          init/3,
+         accept/3,
+         udp_recv/3,
          start_listeners/0,
          start_listener/3,
          stop_listeners/0,
@@ -44,18 +46,22 @@
 %% We do not block on send anymore.
 -define(TCP_SEND_TIMEOUT, 15000).
 
--spec start_link() -> 'ignore' | {'error',_} | {'ok',pid()}.
+-type proto() :: tcp | udp | ws | wss.
+-type addr() :: inet:ip4_address() | string().
+-type portnum() :: inet:port_number().
+-type port_ip_proto() :: portnum() | {portnum(), addr() | proto()} | {portnum(), addr(), proto()}.
+
+-spec start_link() -> 'ignore' | {'error', _} | {'ok', pid()}.
 start_link() ->
     supervisor:start_link({local, ejabberd_listeners}, ?MODULE, []).
 
 
 init(_) ->
-    ets:new(listen_sockets, [named_table, public]),
     %bind_tcp_ports(),
     {ok, {{one_for_one, 10, 1}, []}}.
 
 
--spec start_listeners() -> 'ignore' | {'ok',{{_,_,_},[any()]}}.
+-spec start_listeners() -> 'ignore' | {'ok', {{_, _, _}, [any()]}}.
 start_listeners() ->
     case ejabberd_config:get_local_option(listen) of
         undefined ->
@@ -89,11 +95,8 @@ report_duplicated_portips(L) ->
             Module :: atom() | tuple(),
             Opts :: [any()]) -> any().
 start(Port, Module, Opts) ->
-    %% Check if the module is an ejabberd listener or an independent listener
-    case Module:socket_type() of
-        independent -> Module:start_listener(Port, Opts);
-        _ -> start_dependent(Port, Module, Opts)
-    end.
+    %% at this point, Module:socket_type() must not be 'independent'
+    start_dependent(Port, Module, Opts).
 
 -spec start_dependent(Port :: _,
                       Module :: atom() | tuple(),
@@ -108,12 +111,13 @@ start_dependent(Port, Module, Opts) ->
             {error, Error}
     end.
 
--spec init(PortIP :: integer() | {_,_} | {_,_,_},
+-spec init(PortIP :: port_ip_proto(),
            Module :: atom(),
            Opts :: [any()]) -> no_return().
 init(PortIP, Module, RawOpts) ->
     {Port, IPT, IPS, IPV, Proto, OptsClean} = parse_listener_portip(PortIP, RawOpts),
     {Opts, SockOpts} = prepare_opts(IPT, IPV, OptsClean),
+
     if Proto == udp ->
             init_udp(PortIP, Module, Opts, SockOpts, Port, IPS);
        true ->
@@ -126,13 +130,13 @@ init(PortIP, Module, RawOpts) ->
                            | {ifaddr, _}
                            | inet:address_family()
                            | {port, inet:port_number()}.
--spec init_udp(PortIP :: integer() | {_,_} | {_,_,_},
+-spec init_udp(PortIPProto :: port_ip_proto(),
                Module :: atom(),
-               Opts :: [any(),...],
+               Opts :: [any(), ...],
                SockOpts :: [udp_listen_option()],
                Port :: inet:port_number(),
                IPS :: [any()]) -> no_return().
-init_udp(PortIP, Module, Opts, SockOpts, Port, IPS) ->
+init_udp(PortIPProto, Module, Opts, SockOpts, Port, IPS) ->
     case gen_udp:open(Port, [binary,
                              {active, false},
                              {reuseaddr, true} |
@@ -140,67 +144,79 @@ init_udp(PortIP, Module, Opts, SockOpts, Port, IPS) ->
         {ok, Socket} ->
             %% Inform my parent that this port was opened succesfully
             proc_lib:init_ack({ok, self()}),
-            udp_recv(Socket, Module, Opts);
+            ?MODULE:udp_recv(Socket, Module, Opts);
         {error, Reason} ->
-            socket_error(Reason, PortIP, Module, SockOpts, Port, IPS)
+            socket_error(Reason, PortIPProto, Module, SockOpts, Port, IPS)
     end.
 
--spec init_tcp(PortIP :: integer() | {_,_} | {_,_,_},
+-spec init_tcp(PortIPProto :: port_ip_proto(),
                Module :: atom(),
-               Opts :: [any(),...],
+               Opts :: [any(), ...],
                SockOpts :: [gen_tcp:listen_option()],
                Port :: inet:port_number(),
                IPS :: [any()]) -> no_return().
-init_tcp(PortIP, Module, Opts, SockOpts, Port, IPS) ->
-    ListenSocket = listen_tcp(PortIP, Module, SockOpts, Port, IPS),
+init_tcp(PortIPProto, Module, Opts, SockOpts, Port, IPS) ->
+    ListenSocket = listen_tcp(PortIPProto, Module, SockOpts, Port, IPS),
     %% Inform my parent that this port was opened succesfully
     proc_lib:init_ack({ok, self()}),
     %% And now start accepting connection attempts
-    accept(ListenSocket, Module, Opts).
+    ?MODULE:accept(ListenSocket, Module, Opts).
 
--spec listen_tcp(PortIP :: integer() | {_,_} | {_,_,_},
+-spec listen_tcp(PortIPPRoto :: port_ip_proto(),
                  Module :: atom(),
                  SockOpts :: [gen_tcp:listen_option()],
                  Port :: inet:port_number(),
-                 IPS :: [any()]) -> gen_tcp:socket().
-listen_tcp(PortIP, Module, SockOpts, Port, IPS) ->
-    case ets:lookup(listen_sockets, PortIP) of
-        [{PortIP, ListenSocket}] ->
-            ?INFO_MSG("Reusing listening port for ~p", [Port]),
-            ets:delete(listen_sockets, PortIP),
+                 IPS :: [any()]) -> port().
+listen_tcp(PortIPProto, Module, SockOpts, Port, IPS) ->
+    DefaultSockOpts = [binary,
+                       {backlog, 100},
+                       {packet, 0},
+                       {active, false},
+                       {reuseaddr, true},
+                       {nodelay, true},
+                       {send_timeout, 120},
+                       {keepalive, true},
+                       {send_timeout_close, true}],
+    FinalSockOpts = override_sock_opts(SockOpts, DefaultSockOpts),
+    Res = listen_or_retry(Port, FinalSockOpts, 10),
+    case Res of
+        {ok, ListenSocket} ->
             ListenSocket;
-        _ ->
-            SockOpts2 = try erlang:system_info(otp_release) >= "R13B" of
-                            true -> [{send_timeout_close, true} | SockOpts];
-                            false -> SockOpts
-                        catch
-                            _:_ -> []
-                        end,
-            Res = gen_tcp:listen(Port, [binary,
-                                        {packet, 0},
-                                        {active, false},
-                                        {reuseaddr, true},
-                                        {nodelay, true},
-                                        {send_timeout, ?TCP_SEND_TIMEOUT},
-                                        {keepalive, true} |
-                                        SockOpts2]),
-            case Res of
-                {ok, ListenSocket} ->
-                    ListenSocket;
-                {error, Reason} ->
-                    socket_error(Reason, PortIP, Module, SockOpts, Port, IPS)
-            end
+        {error, Reason} ->
+            socket_error(Reason, PortIPProto, Module, SockOpts, Port, IPS)
     end.
 
-%% @spec (PortIP, Opts) -> {Port, IPT, IPS, IPV, OptsClean}
-%% where
-%%      PortIP = Port | {Port, IPT | IPS}
-%%      Port = integer()
-%%      IPT = tuple()
-%%      IPS = string()
-%%      IPV = inet | inet6
-%%      Opts = [IPV | {ip, IPT} | atom() | tuple()]
-%%      OptsClean = [atom() | tuple()]
+%% Process exit and socket release are not transactional
+%% So, there can be a short period of time when we can't bind
+listen_or_retry(Port, SockOpts, Retries) ->
+    case gen_tcp:listen(Port, SockOpts) of
+        {ok, ListenSocket} ->
+            {ok, ListenSocket};
+        {error, eaddrinuse} when Retries > 0 ->
+            timer:sleep(100),
+            listen_or_retry(Port, SockOpts, Retries-1);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+override_sock_opts([], Opts) ->
+    Opts;
+override_sock_opts([Override | OverrideOpts], Opts) ->
+    NewOpts = do_override(Override, Opts),
+    override_sock_opts(OverrideOpts, NewOpts).
+
+do_override({ip, _} = IP, Opts) ->
+    lists:keystore(ip, 1, Opts, IP);
+do_override({backlog, _} = Backlog, Opts) ->
+    lists:keystore(backlog, 1, Opts, Backlog);
+do_override(inet6, Opts) ->
+    [inet6 | lists:delete(inet6, Opts)];
+do_override(inet, Opts) ->
+    [inet | lists:delete(inet, Opts)];
+do_override(_, Opts) ->
+    Opts.
+
+
 %% @doc Parse any kind of ejabberd listener specification.
 %% The parsed options are returned in several formats.
 %% OptsClean does not include inet/inet6 or ip options.
@@ -208,22 +224,22 @@ listen_tcp(PortIP, Module, SockOpts, Port, IPS) ->
 %% but they are only used when no IP address was specified in the PortIP.
 %% The IP version (either IPv4 or IPv6) is inferred from the IP address type,
 %% so the option inet/inet6 is only used when no IP is specified at all.
--spec parse_listener_portip(PortIP :: integer() | {_,_} | {_,_,_},
+-spec parse_listener_portip(PortIPProto :: port_ip_proto(),
                             Opts :: [any()]
-                            ) -> {inet:port_number(),
+                            ) -> {portnum(),
                                   IPT :: tuple(),
                                   IPS :: [any()],
                                   IPV :: 'inet' | 'inet6',
-                                  Proto :: 'tcp' | 'udp' | 'ws' | 'wss',
+                                  Proto :: proto(),
                                   OptsClean :: [any()]}.
-parse_listener_portip(PortIP, Opts) ->
+parse_listener_portip(PortIPProto, Opts) ->
     {IPOpt, Opts2} = strip_ip_option(Opts),
     {IPVOpt, OptsClean} = case lists:member(inet6, Opts2) of
                               true -> {inet6, Opts2 -- [inet6]};
                               false -> {inet, Opts2}
                           end,
     {Port, IPT, IPS, Proto} =
-        case add_proto(PortIP, Opts) of
+        case add_proto(PortIPProto, Opts) of
             {P, Prot} ->
                 T = get_ip_tuple(IPOpt, IPVOpt),
                 S = inet_parse:ntoa(T),
@@ -244,7 +260,7 @@ parse_listener_portip(PortIP, Opts) ->
 
 -spec prepare_opts(IPT :: tuple(),
                    IPV :: 'inet' | 'inet6',
-                   OptsClean :: [any()]) -> {[any(),...],[any()]}.
+                   OptsClean :: [any()]) -> {[any(), ...], [any()]}.
 prepare_opts(IPT, IPV, OptsClean) ->
     %% The first inet|inet6 and the last {ip, _} work,
     %% so overriding those in Opts
@@ -257,10 +273,11 @@ prepare_opts(IPT, IPV, OptsClean) ->
                             end, Opts),
     {Opts, SockOpts}.
 
--spec add_proto(Port :: integer() | {_,_} | {_,_,_},
+
+-spec add_proto(PortIPProto :: port_ip_proto(),
                 Opts :: [any()]
-                ) -> {P :: integer(), 'tcp' | 'udp' | 'ws' | 'wss'}
-                   | {P :: integer(), Addr :: _, 'tcp' | 'udp' | 'ws' | 'wss'}.
+                ) -> {P :: portnum(), proto()}
+                   | {P :: portnum(), Addr :: addr(), proto()}.
 add_proto(Port, Opts) when is_integer(Port) ->
     {Port, get_proto(Opts)};
 add_proto({Port, Proto}, _Opts) when is_atom(Proto) ->
@@ -296,7 +313,7 @@ get_ip_tuple(IPOpt, _IPVOpt) ->
 
 -spec accept(Socket :: port(),
              Module :: atom(),
-             Opts :: [any(),...]) -> no_return().
+             Opts :: [any(), ...]) -> no_return().
 accept(ListenSocket, Module, Opts) ->
     case gen_tcp:accept(ListenSocket) of
         {ok, Socket} ->
@@ -307,17 +324,17 @@ accept(ListenSocket, Module, Opts) ->
                 _ ->
                     ok
             end,
-            ejabberd_socket:start(strip_frontend(Module), gen_tcp, Socket, Opts),
-            accept(ListenSocket, Module, Opts);
+            ejabberd_socket:start(Module, gen_tcp, Socket, Opts),
+            ?MODULE:accept(ListenSocket, Module, Opts);
         {error, Reason} ->
             ?INFO_MSG("(~w) Failed TCP accept: ~w",
                       [ListenSocket, Reason]),
-            accept(ListenSocket, Module, Opts)
+            ?MODULE:accept(ListenSocket, Module, Opts)
     end.
 
 -spec udp_recv(Socket :: port(),
                Module :: atom(),
-               Opts :: [any(),...]) -> no_return().
+               Opts :: [any(), ...]) -> no_return().
 udp_recv(Socket, Module, Opts) ->
     case gen_udp:recv(Socket, 0) of
         {ok, {Addr, Port, Packet}} ->
@@ -330,15 +347,15 @@ udp_recv(Socket, Module, Opts) ->
                 _ ->
                     ok
             end,
-            udp_recv(Socket, Module, Opts);
+            ?MODULE:udp_recv(Socket, Module, Opts);
         {error, Reason} ->
             ?ERROR_MSG("unexpected UDP error: ~s", [format_error(Reason)]),
             throw({error, Reason})
     end.
 
--spec start_listener(Port :: integer(),
+-spec start_listener(PortIPProto :: port_ip_proto(),
                      Module :: atom(),
-                     Opts :: [any()]) -> {'error', pid()} | {'ok',_}.
+                     Opts :: [any()]) -> {'error', pid()} | {'ok', _}.
 start_listener(Port, Module, Opts) ->
     case start_listener2(Port, Module, Opts) of
         {ok, _Pid} = R -> R;
@@ -360,9 +377,9 @@ start_listener2(Port, Module, Opts) ->
     start_module_sup(Port, Module),
     start_listener_sup(Port, Module, Opts).
 
--spec start_module_sup(_, Module :: atom())
-      -> {'error',_} | {'ok','undefined' | pid()} | {'ok','undefined' | pid(),_}.
-start_module_sup(_Port, Module) ->
+-spec start_module_sup(_, Module :: module())
+      -> {'error', _} | {'ok', 'undefined' | pid()} | {'ok', 'undefined' | pid(), _}.
+start_module_sup(_PortIPProto, Module) ->
     Proc1 = gen_mod:get_module_proc("sup", Module),
     ChildSpec1 =
         {Proc1,
@@ -373,48 +390,47 @@ start_module_sup(_Port, Module) ->
          [ejabberd_tmp_sup]},
     supervisor:start_child(ejabberd_sup, ChildSpec1).
 
--spec start_listener_sup(_, Module :: atom(), Opts :: [any()])
-      -> {'error',_} | {'ok','undefined' | pid()} | {'ok','undefined' | pid(),_}.
-start_listener_sup(Port, Module, Opts) ->
-    ChildSpec = {Port,
-                 {?MODULE, start, [Port, Module, Opts]},
-                 transient,
-                 brutal_kill,
-                 worker,
-                 [?MODULE]},
-    supervisor:start_child(ejabberd_listeners, ChildSpec).
+-spec start_listener_sup(port_ip_proto(), Module :: atom(), Opts :: [any()])
+      -> {'error', _} | {'ok', 'undefined' | pid()} | {'ok', 'undefined' | pid(), _}.
+start_listener_sup(PortIPProto, Module, Opts) ->
+    case Module:socket_type() of
+        independent ->
+            Module:start_listener(PortIPProto, Opts);
+        _ ->
+
+            ChildSpec = {PortIPProto,
+                         {?MODULE, start, [PortIPProto, Module, Opts]},
+                         transient,
+                         brutal_kill,
+                         worker,
+                         [?MODULE]},
+            supervisor:start_child(ejabberd_listeners, ChildSpec)
+    end.
 
 -spec stop_listeners() -> 'ok'.
 stop_listeners() ->
     Ports = ejabberd_config:get_local_option(listen),
     lists:foreach(
       fun({PortIpNetp, Module, _Opts}) ->
-              delete_listener(PortIpNetp, Module)
+              stop_listener(PortIpNetp, Module)
       end,
       Ports).
 
--spec stop_listener(PortIP :: {integer(), tuple() | string()},
+-spec stop_listener(PortIPProto :: port_ip_proto(),
                     Module :: atom())
-      -> 'ok' | {'error','not_found' | 'restarting' | 'running' | 'simple_one_for_one'}.
-stop_listener(PortIP, _Module) ->
-    case ets:match(listen_sockets, {PortIP,'$1'}) of
-        [[Socket]] ->
-            true = ets:delete_object(listen_sockets, {PortIP, Socket}),
-            ok = gen_tcp:close(Socket);
-        _ ->
-            ok
-    end,
-    supervisor:terminate_child(ejabberd_listeners, PortIP),
-    supervisor:delete_child(ejabberd_listeners, PortIP).
+      -> 'ok' | {'error', 'not_found' | 'restarting' | 'running' | 'simple_one_for_one'}.
+stop_listener(PortIPProto, Module) ->
+    supervisor:terminate_child(ejabberd_listeners, PortIPProto),
+    supervisor:delete_child(ejabberd_listeners, PortIPProto).
 
 %% @doc Add a listener and store in config if success
 -type listener_option() :: inet | inet6 | {ip, tuple()} | atom() | tuple().
--spec add_listener(PortIP :: integer() | {_,_} | {_,_,_},
+-spec add_listener(PortIPProto :: port_ip_proto(),
                    Module :: atom(),
                    Opts :: [listener_option()]
-                   ) -> 'ok' | {'error',_}.
-add_listener(PortIP, Module, Opts) ->
-    {Port, IPT, _, _, Proto, _} = parse_listener_portip(PortIP, Opts),
+                   ) -> 'ok' | {'error', _}.
+add_listener(PortIPProto, Module, Opts) ->
+    {Port, IPT, _, _, Proto, _} = parse_listener_portip(PortIPProto, Opts),
     PortIP1 = {Port, IPT, Proto},
     case start_listener(PortIP1, Module, Opts) of
         {ok, _Pid} ->
@@ -428,24 +444,23 @@ add_listener(PortIP, Module, Opts) ->
             Ports2 = [{PortIP1, Module, Opts} | Ports1],
             ejabberd_config:add_local_option(listen, Ports2),
             ok;
-        {error, {already_started, _Pid}} ->
-            {error, {already_started, PortIP}};
         {error, Error} ->
             {error, Error}
     end.
 
--spec delete_listener(PortIP :: integer() | {_,_} | {_,_,_},
+-spec delete_listener(PortIPProto :: port_ip_proto(),
                       Module :: atom())
-      -> 'ok' | {'error','not_found' | 'restarting' | 'running' | 'simple_one_for_one'}.
-delete_listener(PortIP, Module) ->
-    delete_listener(PortIP, Module, []).
+      -> 'ok' | {'error', 'not_found' | 'restarting' | 'running' | 'simple_one_for_one'}.
+delete_listener(PortIPProto, Module) ->
+    delete_listener(PortIPProto, Module, []).
 
--spec delete_listener(PortIP :: integer() | {_,_} | {_,_,_},
+-spec delete_listener(PortIPProto :: port_ip_proto(),
                       Module :: atom(),
                       Opts :: [listener_option()])
-      -> 'ok' | {'error','not_found' | 'restarting' | 'running' | 'simple_one_for_one'}.
-delete_listener(PortIP, Module, Opts) ->
-    {Port, IPT, _, _, Proto, _} = parse_listener_portip(PortIP, Opts),
+      -> 'ok' | {'error', 'not_found' | 'restarting' | 'running' | 'simple_one_for_one'}.
+delete_listener(PortIPProto, Module, Opts) ->
+%%    this one stops a listener and deletes it from configuration, used while reloading config
+    {Port, IPT, _, _, Proto, _} = parse_listener_portip(PortIPProto, Opts),
     PortIP1 = {Port, IPT, Proto},
     Ports = case ejabberd_config:get_local_option(listen) of
                 undefined ->
@@ -456,13 +471,6 @@ delete_listener(PortIP, Module, Opts) ->
     Ports1 = lists:keydelete(PortIP1, 1, Ports),
     ejabberd_config:add_local_option(listen, Ports1),
     stop_listener(PortIP1, Module).
-
--spec strip_frontend(atom() | {frontend, atom()}) -> atom().
-strip_frontend({frontend, Module}) ->
-    ?ERROR_MSG("using deprecated feature: frontend socket~n", []),
-    Module;
-strip_frontend(Module) when is_atom(Module) ->
-    Module.
 
 %%%
 %%% Check options
@@ -498,7 +506,7 @@ includes_deprecated_ssl_option(Opts) ->
             lists:member(ssl, Opts)
     end.
 
--spec certfile_readable([any()]) -> 'true' | {'false',string()}.
+-spec certfile_readable([any()]) -> 'true' | {'false', string()}.
 certfile_readable(Opts) ->
     case proplists:lookup(certfile, Opts) of
         none -> true;

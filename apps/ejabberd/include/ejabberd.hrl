@@ -18,8 +18,6 @@
 %%% 02111-1307 USA
 %%%
 %%%----------------------------------------------------------------------
--ifndef(MONGOOSEIM_EJABBERD_HRL).
--define(MONGOOSEIM_EJABBERD_HRL, true).
 
 %% This macro returns a string of the ejabberd version running, e.g. "2.3.4"
 %% If the ejabberd application description isn't loaded, returns atom: undefined
@@ -31,9 +29,9 @@
 
 -define(MSGS_DIR,    "msgs").
 -define(CONFIG_PATH, "etc/ejabberd.cfg").
--define(LOG_PATH,    "log/ejabberd.log").
 
 -define(EJABBERD_URI, "http://www.process-one.net/en/ejabberd/").
+-define(MONGOOSE_URI, <<"https://www.erlang-solutions.com/products/mongooseim-massively-scalable-ejabberd-platform">>).
 
 -define(S2STIMEOUT, 600000).
 
@@ -41,10 +39,6 @@
 
 %% ---------------------------------
 %% Logging mechanism
-
-%% Print in standard output
--define(PRINT(Format, Args),
-    io:format(Format, Args)).
 
 -define(DEBUG(Format, Args),
     lager:debug(Format, Args)).
@@ -61,19 +55,12 @@
 -define(CRITICAL_MSG(Format, Args),
     lager:critical(Format, Args)).
 
--record(session, {sid      :: ejabberd_sm:sid(),
-                  usr      :: ejabberd:simple_jid(),
-                  us       :: ejabberd:simple_bare_jid(),
-                  priority :: integer(),
-                  info     :: list()
+-record(session, {sid,
+                  usr,
+                  us,
+                  priority,
+                  info
                  }).
-
--ifdef(no_binary_to_integer).
-
--import(ejabberd_binary, [binary_to_integer/1,
-                          integer_to_binary/1]).
-
--endif. % ifdef no_binary_to_integer
 
 -record(scram,
         {storedkey = <<"">>,
@@ -83,4 +70,25 @@
 
 -type scram() :: #scram{}.
 
--endif. % ifdef MONGOOSEIM_EJABBERD_HRL
+-record(route, {
+          domain :: binary(),
+          handler :: mongoose_packet_handler:t()
+         }).
+
+-record(external_component, {domain, handler, node}).
+
+-define(DEPRECATED,
+    ok).
+%%    lager:error("Deprecated call", [])).
+%% Not to break things, we often change a function arity or pattern but keep the old one
+%% so that parts of the code not yet rewritten still work. Eventually all those things
+%% will go away. This macro denotes a function called in a deprecated way.
+
+-define(TEMPORARY, ok).
+%% just a marker - oftentimes we create a mongoose_acc just because we call a hook
+%% while the 'real' accumulator doesn't yet reach this point, so for compatibility
+%% we have to mock it. This macro is to mark such places in the code.
+
+
+-define(DUMP(Acc),
+    mongoose_acc:dump(Acc)).

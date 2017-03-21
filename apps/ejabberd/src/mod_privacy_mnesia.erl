@@ -29,7 +29,6 @@
 -module(mod_privacy_mnesia).
 -author('alexey@process-one.net').
 -author('arcusfelis@gmail.com').
-
 -behaviour(mod_privacy).
 
 -export([init/2,
@@ -108,9 +107,7 @@ forget_default_list(LUser, LServer) ->
         {atomic, ok} ->
             ok;
         {aborted, Reason} ->
-            {error, {aborted, Reason}};
-        {error, Reason} ->
-            {error, Reason}
+            {error, {aborted, Reason}}
     end.
 
 set_default_list(LUser, LServer, Name) ->
@@ -134,9 +131,7 @@ set_default_list(LUser, LServer, Name) ->
         {atomic, {error, Reason}} ->
             {error, Reason};
         {aborted, Reason} ->
-            {error, {aborted, Reason}};
-        {error, Reason} ->
-            {error, Reason}
+            {error, {aborted, Reason}}
     end.
 
 remove_privacy_list(LUser, LServer, Name) ->
@@ -161,9 +156,7 @@ remove_privacy_list(LUser, LServer, Name) ->
         {atomic, {error, _} = Error} ->
             Error;
         {aborted, Reason} ->
-            {error, {aborted, Reason}};
-        {error, Reason} ->
-            {error, Reason}
+            {error, {aborted, Reason}}
     end.
 
 replace_privacy_list(LUser, LServer, Name, List) ->
@@ -185,11 +178,10 @@ replace_privacy_list(LUser, LServer, Name, List) ->
         {atomic, ok} ->
             ok;
         {aborted, Reason} ->
-            {error, {aborted, Reason}};
-        {error, Reason} ->
-            {error, Reason}
+            {error, {aborted, Reason}}
     end.
 
 remove_user(LUser, LServer) ->
     F = fun() -> mnesia:delete({privacy, {LUser, LServer}}) end,
     mnesia:transaction(F).
+

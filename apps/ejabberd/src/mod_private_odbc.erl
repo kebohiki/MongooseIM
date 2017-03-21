@@ -44,32 +44,37 @@ init(_Host, _Opts) ->
 
 multi_set_data(LUser, LServer, NS2XML) ->
     F = fun() -> multi_set_data_t(LUser, LServer, NS2XML) end,
-    odbc_queries:sql_transaction(LServer, F).
+    case rdbms_queries:sql_transaction(LServer, F) of
+        {atomic, ok} -> ok;
+        {aborted, Reason} -> {aborted, Reason};
+        {error, Reason} -> {error, Reason}
+    end.
 
 multi_set_data_t(LUser, LServer, NS2XML) ->
-    [set_data_t(LUser, LServer, NS, XML) || {NS, XML} <- NS2XML],
+    SLUser = mongoose_rdbms:escape(LUser),
+    [set_data_t(SLUser, LServer, NS, XML) || {NS, XML} <- NS2XML],
     ok.
 
-set_data_t(LUser, LServer, NS, XML) ->
-    SLUser = ejabberd_odbc:escape(LUser),
-    SNS = ejabberd_odbc:escape(NS),
-    SData = ejabberd_odbc:escape(xml:element_to_binary(XML)),
-    odbc_queries:set_private_data(LServer, SLUser, SNS, SData).
+set_data_t(SLUser, LServer, NS, XML) ->
+    SNS = mongoose_rdbms:escape(NS),
+    SData = mongoose_rdbms:escape(exml:to_binary(XML)),
+    rdbms_queries:set_private_data(LServer, SLUser, SNS, SData).
 
 multi_get_data(LUser, LServer, NS2Def) ->
     [get_data(LUser, LServer, NS, Default) || {NS, Default} <- NS2Def].
 
 %% @doc Return stored value or default.
 get_data(LUser, LServer, NS, Default) ->
-    SLUser = ejabberd_odbc:escape(LUser),
-    SNS = ejabberd_odbc:escape(NS),
-    case catch odbc_queries:get_private_data(LServer, SLUser, SNS) of
-        {selected, [<<"data">>], [{SData}]} ->
-            #xmlel{} = xml_stream:parse_element(SData);
+    SLUser = mongoose_rdbms:escape(LUser),
+    SNS = mongoose_rdbms:escape(NS),
+    case catch rdbms_queries:get_private_data(LServer, SLUser, SNS) of
+        {selected, [{SData}]} ->
+            {ok, Elem} = exml:parse(SData),
+            Elem;
         _ ->
             Default
     end.
 
 remove_user(LUser, LServer) ->
-    SLUser = ejabberd_odbc:escape(LUser),
-    odbc_queries:del_user_private_storage(LServer, SLUser).
+    SLUser = mongoose_rdbms:escape(LUser),
+    rdbms_queries:del_user_private_storage(LServer, SLUser).

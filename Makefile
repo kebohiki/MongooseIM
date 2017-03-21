@@ -1,129 +1,81 @@
-.PHONY: rel deps test show_test_results
-
+.PHONY: rel
+LOG=$(subst TARGET,$@,TARGET.log 2>&1 || (cat TARGET.log; exit 1))
+SILENCE_COVER =  | grep -v "logs.*\\.coverdata"
+SILENCE_COVER += | grep -v "Analysis includes data from imported files"
+SILENCE_COVER += | grep -v "WARNING: Deleting data for module"
+LOG_SILENCE_COVER=$(subst TARGET,$@,TARGET.log 2>&1 || (cat TARGET.log $(SILENCE_COVER); exit 1))
 EJABBERD_DIR = apps/ejabberd
-EJD_INCLUDE = $(EJABBERD_DIR)/include
-EJD_PRIV = $(EJABBERD_DIR)/priv
-DEVNODES = node1 node2
+XEP_TOOL = tools/xep_tool
+EJD_EBIN = $(EJABBERD_DIR)/ebin
+DEVNODES = mim1 mim2 mim3 fed1
 
-all: deps compile
+# Top-level targets aka user interface
 
-compile: rebar
-	./rebar $(OTPS) compile
+all: rel
 
-deps: rebar
-	./rebar get-deps
+dev: $(DEVNODES)
 
-clean: rebar
-	rm -rf apps/*/logs
-	./rebar clean
+clean:
+	-rm -rf _build
+	-rm rel/configure.vars.config
+	-rm rel/vars.config
 
-quick_compile: rebar
-	./rebar $(OPTS) compile skip_deps=true
+ct:
+	@(if [ "$(SUITE)" ]; then ./rebar3 ct --dir apps/ejabberd/test --suite $(SUITE) ;\
+		else ./rebar3 ct ; fi) > $(LOG_SILENCE_COVER)
 
-reload: quick_compile
-	@E=`ls ./rel/mongooseim/lib/ | grep ejabberd-2 | sort -r | head -n 1` ;\
-	rsync -uW ./apps/ejabberd/ebin/*beam ./rel/mongooseim/lib/$$E/ebin/ ;\
+rel: certs configure.out rel/vars.config
+	. ./configure.out && ./rebar3 as prod release
 
-reload_dev: quick_compile
-	@E=`ls ./dev/mongooseim_node1/lib/ | grep ejabberd-2 | sort -r | head -n 1` ;\
-	rsync -uW ./apps/ejabberd/ebin/*beam ./dev/mongooseim_node1/lib/$$E/ebin/ ;\
+shell: certs etc/ejabberd.cfg
+	./rebar3 shell
 
-ct: deps quick_compile
-	@if [ "$(SUITE)" ]; then ./rebar -q ct suite=$(SUITE) skip_deps=true;\
-	else ./rebar -q ct skip_deps=true; fi
+# Top-level targets' dependency chain
 
-# This compiles and runs one test suite. For quick feedback/TDD.
-# Example:
-# $ make qct SUITE=amp_resolver_SUITE
-qct:
-	mkdir -p /tmp/ct_log
-	ct_run -pa apps/*/ebin -pa deps/*/ebin -dir apps/*/test\
-        -I apps/*/include -logdir /tmp/ct_log -suite $(SUITE) -noshell
+rock:
+	@if [ "$(FILE)" ]; then elvis rock $(FILE);\
+	elif [ "$(BRANCH)" ]; then tools/rock_changed.sh $(BRANCH); \
+	else tools/rock_changed.sh; fi
 
-test: test_deps
-	cd test/ejabberd_tests; make test
+rel/vars.config: rel/vars.config.in rel/configure.vars.config
+	cat $^ > $@
 
-test_preset: test_deps
-	cd test/ejabberd_tests; make test_preset
-
-
-run: deps compile quickrun
-
-quickrun: etc/ejabberd.cfg
-	erl -sname mongooseim@localhost -setcookie ejabberd -pa deps/*/ebin apps/*/ebin -config rel/files/app.config -s ejabberd
+## Don't allow these files to go out of sync!
+configure.out rel/configure.vars.config:
+	./tools/configure with-all
 
 etc/ejabberd.cfg:
-	tools/generate_cfg.es etc/ejabberd.cfg
-
-
-cover_test: test_deps
-	cd test/ejabberd_tests; make cover_test
-
-cover_test_preset: test_deps
-	cd test/ejabberd_tests; make cover_test_preset
-
-quicktest: test_deps
-	cd test/ejabberd_tests; make quicktest
-
-show_test_results:
-	$$BROWSER `ls -td test/ct_report/ct_run.test@*/index.html | head -n 1` & disown
-
-eunit: rebar deps
-	./rebar compile
-	./rebar skip_deps=true eunit
-
-configure:
-	./tools/configure $(filter-out $@,$(MAKECMDGOALS))
-
-rel: rebar deps
-	./rebar compile generate -f
+	@mkdir -p $(@D)
+	tools/generate_cfg.es etc/ejabberd.cfg rel/files/ejabberd.cfg
 
 devrel: $(DEVNODES)
 
-$(DEVNODES): rebar deps compile deps_dev
+$(DEVNODES): certs configure.out rel/vars.config
 	@echo "building $@"
-	(cd rel && ../rebar generate -f target_dir=../dev/mongooseim_$@ overlay_vars=./reltool_vars/$@_vars.config)
-	cp -R `dirname $(shell ./readlink.sh $(shell which erl))`/../lib/tools-* dev/mongooseim_$@/lib/
+	(. ./configure.out && \
+	DEVNODE=true ./rebar3 as $@ release) > $(LOG_SILENCE_COVER)
 
-deps_dev:
-	mkdir -p dev
-	cp rel/files/test_cert.pem /tmp/server.pem
-	cp rel/files/sample_external_auth.py /tmp
+certs: priv/ssl/fake_cert.pem priv/ssl/fake_server.pem priv/ssl/fake_dh_server.pem
 
-devclean:
-	rm -rf dev/*
+priv/ssl/fake_cert.pem:
+	@mkdir -p $(@D)
+	openssl req \
+	-x509 -nodes -days 365 \
+	-subj '/C=PL/ST=ML/L=Krakow/CN=mongoose-im' \
+	-newkey rsa:2048 -keyout priv/ssl/fake_key.pem -out priv/ssl/fake_cert.pem
+
+priv/ssl/fake_server.pem: priv/ssl/fake_cert.pem
+	cat priv/ssl/fake_cert.pem priv/ssl/fake_key.pem > priv/ssl/fake_server.pem
+
+priv/ssl/fake_dh_server.pem:
+	@mkdir -p $(@D)
+	openssl dhparam -outform PEM -out priv/ssl/fake_dh_server.pem 1024
+
+xeplist: escript
+	escript $(XEP_TOOL)/xep_tool.escript markdown $(EJD_EBIN)
+
+install: configure.out rel
+	@. ./configure.out && tools/install
 
 cover_report: /tmp/mongoose_combined.coverdata
-	erl -noshell -pa apps/*/ebin deps/*/ebin -eval 'ecoveralls:travis_ci("$?"), init:stop()'
-
-relclean:
-	rm -rf rel/mongooseim
-
-COMBO_PLT = .mongooseim_combo_dialyzer.plt
-DEPS_LIBS     = $(wildcard deps/*/ebin/*.beam)
-MONGOOSE_LIBS = $(wildcard apps/ejabberd/ebin/*.beam)
-
-OTP_APPS      = compiler crypto erts kernel stdlib mnesia ssl ssh
-DIALYZER_APPS = ejabberd
-DIALYZER_APPS_PATHS = $(addsuffix /ebin, $(addprefix apps/, $(DIALYZER_APPS)))
-
-check_plt:
-	dialyzer --check_plt --plt $(COMBO_PLT) $(MONGOOSE_LIBS)
-
-build_plt:
-	dialyzer --build_plt --apps $(OTP_APPS) \
-		--output_plt $(COMBO_PLT) $(DEPS_LIBS) $(MONGOOSE_LIBS)
-
-dialyzer: compile
-	dialyzer -Wno_return --fullpath --plt $(COMBO_PLT) $(DIALYZER_APPS_PATHS) | \
-	    fgrep -v -f ./dialyzer.ignore-warnings | tee dialyzer.log
-
-cleanplt:
-	rm $(COMBO_PLT)
-
-
-test_deps: rebar
-	./rebar -C rebar.tests.config get-deps
-
-%:
-	@:
+	erl -noshell -pa _build/default/lib/*/ebin -eval 'ecoveralls:travis_ci("$?"), init:stop()' > $(LOG)

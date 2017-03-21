@@ -48,15 +48,13 @@
 -include("jlib.hrl").
 -include_lib("exml/include/exml.hrl").
 
--define(GEN_FSM, p1_fsm).
-
 -type status() :: binary().
 -type u_s_r_p_st() :: { User    :: ejabberd:user(),
                         Server  :: ejabberd:server(),
                         Res     :: ejabberd:resource(),
                         Prio    :: integer(),
                         Status  :: status()}.
--type formatted_user_info() :: {U_S_R :: string(),
+-type formatted_user_info() :: {USR :: string(),
                                 Conn :: string(),
                                 IPS :: string(),
                                 Port :: inet:port_number(),
@@ -72,7 +70,7 @@
 %%% Register commands
 %%%
 
--spec commands() -> [ejabberd_commands:cmd(),...].
+-spec commands() -> [ejabberd_commands:cmd(), ...].
 commands() ->
     SessionDisplay = {list,
                       {sessions, {tuple,
@@ -100,7 +98,8 @@ commands() ->
         #ejabberd_commands{name = kick_session, tags = [session],
                            desc = "Kick a user session",
                            module = ?MODULE, function = kick_session,
-                           args = [{user, binary}, {host, binary}, {resource, binary}, {reason, binary}],
+                           args = [{user, binary}, {host, binary},
+                                   {resource, binary}, {reason, binary}],
                            result = {res, rescode}},
         #ejabberd_commands{name = status_num_host, tags = [session, stats],
                            desc = "Number of logged users with this status in host",
@@ -198,10 +197,10 @@ kick_session(User, Server, Resource, ReasonText) ->
 -spec kick_this_session(ejabberd:user(), ejabberd:server(), ejabberd:resource(),
         Reason :: binary()) -> ok | {error, lager_not_started}.
 kick_this_session(User, Server, Resource, Reason) ->
-    ejabberd_router:route(
-        jlib:make_jid(<<"">>, <<"">>, <<"">>),
-        jlib:make_jid(User, Server, Resource),
-        #xmlel{name = <<"broadcast">>, children=[{exit, Reason}]}).
+    ejabberd_sm:route(
+        jid:make(<<"">>, <<"">>, <<"">>),
+        jid:make(User, Server, Resource),
+        {broadcast, {exit, Reason}}).
 
 
 -spec prepare_reason(binary() | string()) -> binary().
@@ -233,18 +232,18 @@ status_list(Host, Status) ->
     [{U, S, R, P, St} || {U, S, R, P, St} <- Res].
 
 
--spec status_list(status()) -> string().
+-spec status_list(binary()) -> [u_s_r_p_st()].
 status_list(Status) ->
     status_list(all, Status).
 
 
--spec get_status_list('all' | ejabberd:server(), status()) -> [{u_s_r_p_st()}].
+-spec get_status_list('all' | ejabberd:server(), status()) -> [u_s_r_p_st()].
 get_status_list(Host, StatusRequired) ->
     Sessions0 = case Host of
         all -> ejabberd_sm:get_full_session_list();
         _ -> ejabberd_sm:get_vh_session_list(Host)
     end,
-    Sessions = [ {ejabberd_c2s:get_presence(Pid), Server, Priority}
+    Sessions = [ {catch ejabberd_c2s:get_presence(Pid), Server, Priority}
                  || {{_, Server, _}, {_, Pid}, Priority, _} <- Sessions0 ],
 
     %% Filter by status
@@ -281,10 +280,13 @@ set_presence(User, Host, Resource, Type, Show, Status, Priority) ->
     Message = {xmlstreamelement,
                #xmlel{ name = <<"presence">>,
                       attrs = [{<<"from">>, USR}, {<<"to">>, US}, {<<"type">>, Type}],
-                      children = [#xmlel{ name = <<"show">>, children = [#xmlcdata{content = Show}]},
-                                  #xmlel{ name = <<"status">>, children = [#xmlcdata{content = Status}]},
-                                  #xmlel{ name = <<"priority">>, children = [#xmlcdata{content = Priority}]}]}},
-    ?GEN_FSM:send_event(Pid, Message).
+                      children = [#xmlel{ name = <<"show">>,
+                                          children = [#xmlcdata{content = Show}]},
+                                  #xmlel{ name = <<"status">>,
+                                          children = [#xmlcdata{content = Status}]},
+                                  #xmlel{ name = <<"priority">>,
+                                          children = [#xmlcdata{content = Priority}]}]}},
+    p1_fsm_old:send_event(Pid, Message).
 
 
 -spec user_sessions_info(ejabberd:user(), ejabberd:server()) -> [formatted_user_info()].

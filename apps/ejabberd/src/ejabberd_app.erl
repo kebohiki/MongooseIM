@@ -29,7 +29,7 @@
 
 -behaviour(application).
 
--export([start_modules/0,start/2, get_log_path/0, prep_stop/1, stop/1]).
+-export([start_modules/0, start/2, prep_stop/1, stop/1]).
 
 -include("ejabberd.hrl").
 
@@ -39,34 +39,35 @@
 %%%
 
 start(normal, _Args) ->
-    ejabberd_loglevel:init(),
-    ejabberd_loglevel:set(4),
+    init_log(),
+    mongoose_fips:notify(),
     write_pid_file(),
     db_init(),
-    xml:start(),
-    application:start(p1_cache_tab),
+    application:start(cache_tab),
 
-    load_drivers([tls_drv, expat_erl]),
     translate:start(),
     acl:start(),
     ejabberd_node_id:start(),
     ejabberd_ctl:init(),
     ejabberd_commands:init(),
+    mongoose_commands:init(),
+    mongoose_subhosts:init(),
     gen_mod:start(),
     ejabberd_config:start(),
     ejabberd_check:config(),
-    maybe_start_alarms(),
     connect_nodes(),
     {ok, _} = Sup = ejabberd_sup:start_link(),
-    init_metrics(),
-    ejabberd_system_monitor:add_handler(),
     ejabberd_rdbms:start(),
+    mongoose_riak:start(),
+    mongoose_cassandra:start(),
+    mongoose_http_client:start(),
     ejabberd_auth:start(),
     cyrsasl:start(),
     %% Profiling
     %%ejabberd_debug:eprof_start(),
     %%ejabberd_debug:fprof_start(),
     start_modules(),
+    mongoose_metrics:init(),
     ejabberd_listener:start_listeners(),
     ejabberd_admin:start(),
     ?INFO_MSG("ejabberd ~s is started in the node ~p", [?VERSION, node()]),
@@ -80,8 +81,8 @@ start(_, _) ->
 prep_stop(State) ->
     ejabberd_listener:stop_listeners(),
     stop_modules(),
+    mongoose_subhosts:stop(),
     broadcast_c2s_shutdown(),
-    mod_websockets:stop(),
     timer:sleep(5000),
     mongoose_metrics:remove_all_metrics(),
     State.
@@ -118,10 +119,7 @@ start_modules() ->
                   undefined ->
                       ok;
                   Modules ->
-                      lists:foreach(
-                        fun({Module, Args}) ->
-                                gen_mod:start_module(Host, Module, Args)
-                        end, Modules)
+                      gen_mod_deps:start_modules(Host, Modules)
               end
       end, ?MYHOSTS).
 
@@ -130,26 +128,17 @@ start_modules() ->
 stop_modules() ->
     lists:foreach(
       fun(Host) ->
-              case ejabberd_config:get_local_option({modules, Host}) of
-                  undefined ->
-                      ok;
-                  Modules ->
-                      lists:foreach(
-                        fun({Module, _Args}) ->
-                                gen_mod:stop_module_keep_config(Host, Module)
-                        end, Modules)
-              end
+          StopModuleFun =
+              fun({Module, _Args}) ->
+                  gen_mod:stop_module_keep_config(Host, Module)
+              end,
+          case ejabberd_config:get_local_option({modules, Host}) of
+              undefined ->
+                  ok;
+              Modules ->
+                  lists:foreach(StopModuleFun, Modules)
+          end
       end, ?MYHOSTS).
-
--spec maybe_start_alarms() -> 'ok'.
-maybe_start_alarms() ->
-    case ejabberd_config:get_local_option(alarms) of
-        undefined ->
-            ok;
-        Env when is_list(Env) ->
-            [application:set_env(alarms, K, V) || {K, V} <- Env],
-            alarms:start()
-    end.
 
 -spec connect_nodes() -> 'ok'.
 connect_nodes() ->
@@ -158,27 +147,8 @@ connect_nodes() ->
             ok;
         Nodes when is_list(Nodes) ->
             lists:foreach(fun(Node) ->
-                                  net_kernel:connect_node(Node)
+                              net_kernel:connect_node(Node)
                           end, Nodes)
-    end.
-
-%% @doc Returns the full path to the ejabberd log file.
-%% It first checks for application configuration parameter 'log_path'.
-%% If not defined it checks the environment variable EJABBERD_LOG_PATH.
-%% And if that one is neither defined, returns the default value:
-%% "ejabberd.log" in current directory.
--spec get_log_path() -> string().
-get_log_path() ->
-    case application:get_env(log_path) of
-        {ok, Path} ->
-            Path;
-        undefined ->
-            case os:getenv("EJABBERD_LOG_PATH") of
-                false ->
-                    ?LOG_PATH;
-                Path ->
-                    Path
-            end
     end.
 
 -spec broadcast_c2s_shutdown() -> 'ok'.
@@ -186,14 +156,14 @@ broadcast_c2s_shutdown() ->
     Children = supervisor:which_children(ejabberd_c2s_sup),
     lists:foreach(
       fun({_, C2SPid, _, _}) ->
-              C2SPid ! system_shutdown
+          C2SPid ! system_shutdown
       end, Children).
 
 %%%
 %%% PID file
 %%%
 
--spec write_pid_file() -> 'ok' | {'error',atom()}.
+-spec write_pid_file() -> 'ok' | {'error', atom()}.
 write_pid_file() ->
     case ejabberd:get_pid_file() of
         false ->
@@ -204,7 +174,7 @@ write_pid_file() ->
 
 -spec write_pid_file(Pid :: string(),
                      PidFilename :: nonempty_string()
-                    ) -> 'ok' | {'error',atom()}.
+                    ) -> 'ok' | {'error', atom()}.
 write_pid_file(Pid, PidFilename) ->
     case file:open(PidFilename, [write]) of
         {ok, Fd} ->
@@ -215,7 +185,7 @@ write_pid_file(Pid, PidFilename) ->
             throw({cannot_write_pid_file, PidFilename, Reason})
     end.
 
--spec delete_pid_file() -> 'ok' | {'error',atom()}.
+-spec delete_pid_file() -> 'ok' | {'error', atom()}.
 delete_pid_file() ->
     case ejabberd:get_pid_file() of
         false ->
@@ -224,26 +194,11 @@ delete_pid_file() ->
             file:delete(PidFilename)
     end.
 
--spec load_drivers([atom()]) -> 'ok'.
-load_drivers([]) ->
-    ok;
-load_drivers([Driver | Rest]) ->
-    case erl_ddll:load_driver(ejabberd:get_so_path(), Driver) of
-        ok ->
-            load_drivers(Rest);
-        {error, permanent} ->
-            load_drivers(Rest);
-        {error, already_loaded} ->
-            load_drivers(Rest);
-        {error, Reason} ->
-            ?CRITICAL_MSG("unable to load driver 'expat_erl': ~s",
-                          [erl_ddll:format_error(Reason)]),
-            exit({driver_loading_failed, Driver, Reason})
+init_log() ->
+    ejabberd_loglevel:init(),
+    case application:get_env(ejabberd, keep_lager_intact, false) of
+        true ->
+            skip;
+        false ->
+            ejabberd_loglevel:set(4)
     end.
-
-init_metrics() ->
-    mongoose_metrics:create_global_metrics(),
-    lists:foreach(
-        fun(Host) ->
-            mongoose_metrics:init_predefined_host_metrics(Host)
-        end, ?MYHOSTS).

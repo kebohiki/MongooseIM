@@ -29,15 +29,11 @@
 
 -export([start/0, stop/0,
          %% Server
-         status/0, reopen_log/0,
-         stop_kindly/2, send_service_message_all_mucs/2,
-         %% Erlang
-         update_list/0, update/1,
+         status/0,
+         send_service_message_all_mucs/2,
          %% Accounts
          register/3, unregister/2,
          registered_users/1,
-         %% Migration jabberd1.4
-         import_file/1, import_dir/1,
          %% Purge DB
          delete_expired_messages/0, delete_old_messages/1,
          %% Mnesia
@@ -47,8 +43,10 @@
          install_fallback_mnesia/1,
          dump_to_textfile/1, dump_to_textfile/2,
          mnesia_change_nodename/4,
-         restore/1 % Still used by some modules
-        ]).
+         restore/1, % Still used by some modules%%
+         get_loglevel/0,
+         join_cluster/1, leave_cluster/0,
+         remove_from_cluster/1]).
 
 -include("ejabberd.hrl").
 -include("ejabberd_commands.hrl").
@@ -72,42 +70,15 @@ commands() ->
                         desc = "Get status of the ejabberd server",
                         module = ?MODULE, function = status,
                         args = [], result = {res, restuple}},
-     #ejabberd_commands{name = stop, tags = [server],
-                        desc = "Stop ejabberd gracefully",
-                        module = init, function = stop,
-                        args = [], result = {res, rescode}},
      #ejabberd_commands{name = restart, tags = [server],
                         desc = "Restart ejabberd gracefully",
                         module = init, function = restart,
                         args = [], result = {res, rescode}},
-%     #ejabberd_commands{name = reopen_log, tags = [logs, server],
-%                       desc = "Reopen the log files",
-%                       module = ?MODULE, function = reopen_log,
-%                       args = [], result = {res, rescode}},
-%     #ejabberd_commands{name = stop_kindly, tags = [server],
-%                       desc = "Inform users and rooms, wait, and stop the server",
-%                       module = ?MODULE, function = stop_kindly,
-%                       args = [{delay, integer}, {announcement, string}],
-%                       result = {res, rescode}},
      #ejabberd_commands{name = get_loglevel, tags = [logs, server],
                         desc = "Get the current loglevel",
-                        module = ejabberd_loglevel, function = get,
+                        module = ?MODULE, function = get_loglevel,
                         args = [],
-                        result = {leveltuple, {tuple, [{levelnumber, integer},
-                                                       {levelatom, atom}
-                                                      ]}}},
-
-%     #ejabberd_commands{name = update_list, tags = [server],
-%                       desc = "List modified modules that can be updated",
-%                       module = ?MODULE, function = update_list,
-%                       args = [],
-%                       result = {modules, {list, {module, string}}}},
-%     #ejabberd_commands{name = update, tags = [server],
-%                       desc = "Update the given module, or use the keyword: all",
-%                       module = ?MODULE, function = update,
-%                       args = [{module, string}],
-%                       result = {res, restuple}},
-
+                        result = {res, restuple}},
      #ejabberd_commands{name = register, tags = [accounts],
                         desc = "Register a user",
                         module = ?MODULE, function = register,
@@ -123,44 +94,14 @@ commands() ->
                         module = ?MODULE, function = registered_users,
                         args = [{host, binary}],
                         result = {users, {list, {username, binary}}}},
-
-%     #ejabberd_commands{name = import_file, tags = [mnesia],
-%                       desc = "Import user data from jabberd14 spool file",
-%                       module = ?MODULE, function = import_file,
-%                       args = [{file, string}], result = {res, restuple}},
-%     #ejabberd_commands{name = import_dir, tags = [mnesia],
-%                       desc = "Import users data from jabberd14 spool dir",
-%                       module = ?MODULE, function = import_dir,
-%                       args = [{file, string}],
-%                       result = {res, restuple}},
-
-%     #ejabberd_commands{name = import_piefxis, tags = [mnesia],
-%                       desc = "Import users data from a PIEFXIS file (XEP-0227)",
-%                       module = ejabberd_piefxis, function = import_file,
-%                       args = [{file, string}], result = {res, rescode}},
-%     #ejabberd_commands{name = export_piefxis, tags = [mnesia],
-%                       desc = "Export data of all users in the server to PIEFXIS files (XEP-0227)",
-%                       module = ejabberd_piefxis, function = export_server,
-%                       args = [{dir, string}], result = {res, rescode}},
-%     #ejabberd_commands{name = export_piefxis_host, tags = [mnesia],
-%                       desc = "Export data of users in a host to PIEFXIS files (XEP-0227)",
-%                       module = ejabberd_piefxis, function = export_host,
-%                       args = [{dir, string}, {host, string}], result = {res, rescode}},
-
      #ejabberd_commands{name = delete_expired_messages, tags = [purge],
                         desc = "Delete expired offline messages from database",
                         module = ?MODULE, function = delete_expired_messages,
-                        args = [], result = {res, rescode}},
+                        args = [], result = {res, restuple}},
      #ejabberd_commands{name = delete_old_messages, tags = [purge],
                         desc = "Delete offline messages older than DAYS",
                         module = ?MODULE, function = delete_old_messages,
-                        args = [{days, integer}], result = {res, rescode}},
-
-%     #ejabberd_commands{name = rename_default_nodeplugin, tags = [mnesia],
-%                       desc = "Update PubSub table from old ejabberd trunk SVN to 2.1.0",
-%                       module = mod_pubsub, function = rename_default_nodeplugin,
-%                       args = [], result = {res, rescode}},
-
+                        args = [{days, integer}], result = {res, restuple}},
      #ejabberd_commands{name = set_master, tags = [mnesia],
                         desc = "Set master node of the clustered Mnesia tables",
                         longdesc = "If you provide as nodename \"self\", this "
@@ -204,13 +145,123 @@ commands() ->
      #ejabberd_commands{name = reload_cluster, tags = [server],
                         desc = "Reload configuration file in the cluster",
                         module = ejabberd_config, function = reload_cluster,
-                        args = [], result = {res, restuple}}
+                        args = [], result = {res, restuple}},
+     #ejabberd_commands{name = join_cluster, tags = [server],
+                        desc = "Join the node to a cluster. Call it from the joining node.
+                                Use `-f` or `--force` flag to avoid question prompt and force join the node",
+                        module = ?MODULE, function = join_cluster,
+                        args = [{node, string}],
+                        result = {res, restuple}},
+     #ejabberd_commands{name = leave_cluster, tags = [server],
+                        desc = "Leave a node from the cluster. Call it from the node that is going to leave.
+                                Use `-f` or `--force` flag to avoid question prompt and force leave the node from cluster",
+                        module = ?MODULE, function = leave_cluster,
+                        args = [],
+                        result = {res, restuple}},
+     #ejabberd_commands{name = remove_from_cluster, tags = [server],
+                        desc = "Remove dead node from the cluster. Call it from the member of the cluster.
+                                Use `-f` or `--force` flag to avoid question prompt and force remove the node",
+                        module = ?MODULE, function = remove_from_cluster,
+                        args = [{node, string}],
+                        result = {res, restuple}}
     ].
 
 
 %%%
 %%% Server management
 %%%
+-spec remove_from_cluster(string()) -> {ok, string()} |
+                                       {node_is_alive, string()} |
+                                       {mnesia_error, string()} |
+                                       {rpc_error, string()}.
+remove_from_cluster(NodeString) ->
+    Node = list_to_atom(NodeString),
+    IsNodeAlive = mongoose_cluster:is_node_alive(Node),
+    case IsNodeAlive of
+        true ->
+            remove_rpc_alive_node(Node);
+        false ->
+            remove_dead_node(Node)
+    end.
+
+remove_dead_node(DeadNode) ->
+    try mongoose_cluster:remove_from_cluster(DeadNode) of
+        ok ->
+            String = io_lib:format("The dead node ~p has been removed from the cluster~n", [DeadNode]),
+            {ok, String}
+    catch
+        error:{node_is_alive, DeadNode} ->
+            String = io_lib:format("The node ~p is alive but shoud not be.~n", [DeadNode]),
+            {node_is_alive, String};
+        error:{del_table_copy_schema, R} ->
+            String = io_lib:format("Cannot delete table schema~n. Reason: ~p", [R]),
+            {mnesia_error, String}
+    end.
+
+remove_rpc_alive_node(AliveNode) ->
+    case rpc:call(AliveNode, mongoose_cluster, leave, []) of
+        {badrpc, Reason} ->
+            String = io_lib:format("Cannot remove the node ~p~n. RPC Reason: ~p", [AliveNode, Reason]),
+            {rpc_error, String};
+        ok ->
+            String = io_lib:format("The node ~p has been removed from the cluster~n", [AliveNode]),
+            {ok, String};
+        Unknown ->
+            String = io_lib:format("Unknown error: ~p~n", [Unknown]),
+            {rpc_error, String}
+    end.
+
+-spec join_cluster(string()) -> {ok, string()} | {pang, string()} | {alread_joined, string()} |
+                                {mnesia_error, string()} | {error, string()}.
+join_cluster(NodeString) ->
+    NodeAtom = list_to_atom(NodeString),
+    NodeList = mnesia:system_info(db_nodes),
+    case lists:member(NodeAtom, NodeList) of
+        true ->
+            String = io_lib:format("The node ~s has already joined the cluster~n", [NodeString]),
+            {alread_joined, String};
+        _ ->
+            do_join_cluster(NodeAtom)
+    end.
+
+do_join_cluster(Node) ->
+    try mongoose_cluster:join(Node) of
+        ok ->
+            String = io_lib:format("You have successfully joined the node ~p to the cluster with node member ~p~n", [node(), Node]),
+            {ok, String}
+    catch
+        error:pang ->
+            String = io_lib:format("Timeout while attempting to connect to node ~s~n", [Node]),
+            {pang, String};
+        error:{cant_get_storage_type, {T, E, R}} ->
+            String = io_lib:format("Cannot get storage type for table ~p~n. Reason: ~p:~p", [T, E, R]),
+            {mnesia_error, String};
+        E:R ->
+            {error, {E, R}}
+    end.
+
+-spec leave_cluster() -> {ok, string()} | {error, term()} | {not_in_cluster, string()}.
+leave_cluster() ->
+    NodeList = mnesia:system_info(running_db_nodes),
+    ThisNode = node(),
+    case NodeList of
+        [ThisNode] ->
+            String = io_lib:format("The node ~p is not in the cluster~n", [node()]),
+            {not_in_cluster, String};
+        _ ->
+            do_leave_cluster()
+    end.
+
+do_leave_cluster() ->
+    try mongoose_cluster:leave() of
+        ok ->
+            String = io_lib:format("You have successfully left the node ~p from the cluster~n", [node()]),
+            {ok, String}
+    catch
+        E:R ->
+            {error, {E, R}}
+    end.
+
 
 -spec status() -> {'ejabberd_not_running', io_lib:chars()} | {'ok', io_lib:chars()}.
 status() ->
@@ -226,108 +277,17 @@ status() ->
         end,
     {Is_running, String1 ++ String2}.
 
--spec reopen_log() -> ok.
-reopen_log() ->
-    ejabberd_hooks:run(reopen_log_hook, []),
-    %% TODO: Use the Reopen log API for logger_h ?
-    ejabberd_logger_h:reopen_log(),
-    case application:get_env(sasl,sasl_error_logger) of
-        {ok, {file, SASLfile}} ->
-            error_logger:delete_report_handler(sasl_report_file_h),
-            ejabberd_logger_h:rotate_log(SASLfile),
-            error_logger:add_report_handler(sasl_report_file_h,
-                {SASLfile, get_sasl_error_logger_type()});
-        _ -> false
-        end,
-    ok.
-
-%% @doc Function copied from Erlang/OTP lib/sasl/src/sasl.erl which doesn't export it
--spec get_sasl_error_logger_type() -> 'all' | 'error' | 'progress'.
-get_sasl_error_logger_type () ->
-    case application:get_env (sasl, errlog_type) of
-        {ok, error} -> error;
-        {ok, progress} -> progress;
-        {ok, all} -> all;
-        {ok, Bad} -> exit ({bad_config, {sasl, {errlog_type, Bad}}});
-        _ -> all
-    end.
-
-%%%
-%%% Stop Kindly
-%%%
-
--spec stop_kindly(DelaySeconds :: number(),
-                  AnnouncementText :: string()) -> 'ok'.
-stop_kindly(DelaySeconds, AnnouncementText) ->
-    Subject = io_lib:format("Server stop in ~p seconds!", [DelaySeconds]),
-    WaitingDesc = io_lib:format("Waiting ~p seconds", [DelaySeconds]),
-    Steps = [
-             {"Stopping ejabberd port listeners",
-              ejabberd_listener, stop_listeners, []},
-             {"Sending announcement to connected users",
-              mod_announce, send_announcement_to_all,
-              [?MYNAME, Subject, AnnouncementText]},
-             {"Sending service message to MUC rooms",
-              ejabberd_admin, send_service_message_all_mucs,
-              [Subject, AnnouncementText]},
-             {WaitingDesc, timer, sleep, [DelaySeconds * 1000]},
-             {"Stopping ejabberd", application, stop, [ejabberd]},
-             {"Stopping Mnesia", mnesia, stop, []},
-             {"Stopping Erlang node", init, stop, []}
-    ],
-    NumberLast = length(Steps),
-    TimestampStart = calendar:datetime_to_gregorian_seconds({date(), time()}),
-    lists:foldl(
-      fun({Desc, Mod, Func, Args}, NumberThis) ->
-              SecondsDiff =
-                  calendar:datetime_to_gregorian_seconds({date(), time()})
-                  - TimestampStart,
-              io:format("[~p/~p ~ps] ~s... ",
-                        [NumberThis, NumberLast, SecondsDiff, Desc]),
-              Result = apply(Mod, Func, Args),
-              io:format("~p~n", [Result]),
-              NumberThis+1
-      end,
-      1,
-      Steps),
-    ok.
 
 -spec send_service_message_all_mucs(Subject :: string() | binary(),
                               AnnouncementText :: string() | binary()) -> 'ok'.
 send_service_message_all_mucs(Subject, AnnouncementText) ->
     Message = io_lib:format("~s~n~s", [Subject, AnnouncementText]),
     lists:foreach(
-      fun(ServerHost) ->
-              MUCHost = gen_mod:get_module_opt_host(
-                          ServerHost, mod_muc, "conference.@HOST@"),
+      fun(Host) ->
+              MUCHost = gen_mod:get_module_opt_subhost(Host, mod_muc, mod_muc:default_host()),
               mod_muc:broadcast_service_message(MUCHost, Message)
       end,
       ?MYHOSTS).
-
-%%%
-%%% ejabberd_update
-%%%
-
--spec update_list() -> [string()].
-update_list() ->
-    {ok, _Dir, UpdatedBeams, _Script, _LowLevelScript, _Check} =
-        ejabberd_update:update_info(),
-    [atom_to_list(Beam) || Beam <- UpdatedBeams].
-
--spec update(string()) -> [{'error',_} | {'ok',[any()]}]
-                        | {'error',_} | {'ok',io_lib:chars()}.
-update("all") ->
-    [update_module(ModStr) || ModStr <- update_list()];
-update(ModStr) ->
-    update_module(ModStr).
-
--spec update_module(string()) -> {'error',_} | {'ok', io_lib:chars()}.
-update_module(ModuleNameString) ->
-    ModuleName = list_to_atom(ModuleNameString),
-    case ejabberd_update:update([ModuleName]) of
-          {ok, Res} -> {ok, io_lib:format("Updated: ~p", [Res])};
-          {error, Reason} -> {error, Reason}
-    end.
 
 %%%
 %%% Account management
@@ -340,16 +300,16 @@ update_module(ModuleNameString) ->
                                       | {'ok', io_lib:chars()}.
 register(User, Host, Password) ->
     case ejabberd_auth:try_register(User, Host, Password) of
-        {atomic, ok} ->
-            {ok, io_lib:format("User ~s@~s successfully registered", [User, Host])};
-        {atomic, exists} ->
+        {error, exists} ->
             String = io_lib:format("User ~s@~s already registered at node ~p",
                                    [User, Host, node()]),
             {exists, String};
         {error, Reason} ->
             String = io_lib:format("Can't register user ~s@~s at node ~p: ~p",
                                    [User, Host, node(), Reason]),
-            {cannot_register, String}
+            {cannot_register, String};
+        _ ->
+            {ok, io_lib:format("User ~s@~s successfully registered", [User, Host])}
     end.
 
 
@@ -365,54 +325,45 @@ registered_users(Host) ->
     SUsers = lists:sort(Users),
     lists:map(fun({U, _S}) -> U end, SUsers).
 
-
-%%%
-%%% Migration management
-%%%
-
--spec import_file(file:name()) -> {'cannot_import_file', io_lib:chars()} | {'ok',[]}.
-import_file(Path) ->
-    case jd2ejd:import_file(Path) of
-        ok ->
-            {ok, ""};
-        {error, Reason} ->
-            String = io_lib:format("Can't import jabberd14 spool file ~p at node ~p: ~p",
-                                   [filename:absname(Path), node(), Reason]),
-            {cannot_import_file, String}
-    end.
-
--spec import_dir(file:name()) -> {'cannot_import_dir', io_lib:chars()} | {'ok',[]}.
-import_dir(Path) ->
-    case jd2ejd:import_dir(Path) of
-        ok ->
-            {ok, ""};
-        {error, Reason} ->
-            String = io_lib:format("Can't import jabberd14 spool dir ~p at node ~p: ~p",
-                                   [filename:absname(Path), node(), Reason]),
-            {cannot_import_dir, String}
-    end.
-
+get_loglevel() ->
+    BackendList = ejabberd_loglevel:get(),
+    F = fun({Backend, Level}) ->
+        {Number, Name} = Level,
+        io_lib:format("loglevel for ~p is ~p which is '~p'",
+                      [Backend, Number, Name])
+        end,
+    StringList = lists:map(F, BackendList),
+    JoinedList = string:join(StringList, "\n"),
+    {ok, JoinedList}.
 
 %%%
 %%% Purge DB
 %%%
 
--spec delete_expired_messages() -> 'ok'.
+-spec delete_expired_messages() -> {ok, iolist()} | {error, iolist()}.
 delete_expired_messages() ->
-    {atomic, ok} = mod_offline:remove_expired_messages(),
-    ok.
+    case mod_offline:remove_expired_messages(?MYNAME) of
+        {ok, C} ->
+            {ok, io_lib:format("Removed ~p messages", [C])};
+        {error, Reason} ->
+            {error, io_lib:format("Can't delete expired messages: ~n~p", [Reason])}
+    end.
 
--spec delete_old_messages(Days :: integer()) -> 'ok'.
+-spec delete_old_messages(Days :: integer()) -> {ok, iolist()} | {error, iolist()}.
 delete_old_messages(Days) ->
-    {atomic, _} = mod_offline:remove_old_messages(Days),
-    ok.
+    case mod_offline:remove_old_messages(?MYNAME, Days) of
+        {ok, C} ->
+            {ok, io_lib:format("Removed ~p messages", [C])};
+        {error, Reason} ->
+            {error, io_lib:format("Can't remove old messages: ~n~p", [Reason])}
+    end.
 
 
 %%%
 %%% Mnesia management
 %%%
 
--spec set_master(Node :: atom() | string()) -> {'error', io_lib:chars()} | {'ok',[]}.
+-spec set_master(Node :: atom() | string()) -> {'error', io_lib:chars()} | {'ok', []}.
 set_master("self") ->
     set_master(node());
 set_master(NodeString) when is_list(NodeString) ->
@@ -427,7 +378,7 @@ set_master(Node) when is_atom(Node) ->
             {error, String}
     end.
 
--spec backup_mnesia(file:name()) -> {'cannot_backup', io_lib:chars()} | {'ok',[]}.
+-spec backup_mnesia(file:name()) -> {'cannot_backup', io_lib:chars()} | {'ok', []}.
 backup_mnesia(Path) ->
     case mnesia:backup(Path) of
         ok ->
@@ -440,7 +391,7 @@ backup_mnesia(Path) ->
 
 -spec restore_mnesia(file:name()) -> {'cannot_restore', io_lib:chars()}
                                    | {'file_not_found', io_lib:chars()}
-                                   | {'ok',[]}
+                                   | {'ok', []}
                                    | {'table_not_exists', io_lib:chars()}.
 restore_mnesia(Path) ->
     case ejabberd_admin:restore(Path) of
@@ -450,11 +401,11 @@ restore_mnesia(Path) ->
             String = io_lib:format("Can't restore backup from ~p at node ~p: ~p",
                                    [filename:absname(Path), node(), Reason]),
             {cannot_restore, String};
-        {aborted,{no_exists,Table}} ->
+        {aborted, {no_exists, Table}} ->
             String = io_lib:format("Can't restore backup from ~p at node ~p: Table ~p does not exist.",
                                    [filename:absname(Path), node(), Table]),
             {table_not_exists, String};
-        {aborted,enoent} ->
+        {aborted, enoent} ->
             String = io_lib:format("Can't restore backup from ~p at node ~p: File not found.",
                                    [filename:absname(Path), node()]),
             {file_not_found, String}
@@ -464,7 +415,7 @@ restore_mnesia(Path) ->
 %% This function is called from ejabberd_ctl, ejabberd_web_admin and
 %% mod_configure/adhoc
 restore(Path) ->
-    mnesia:restore(Path, [{keep_tables,keep_tables()},
+    mnesia:restore(Path, [{keep_tables, keep_tables()},
                           {default_op, skip_tables}]).
 
 %% @doc This function return a list of tables that should be kept from a
@@ -523,7 +474,7 @@ dump_table(Path, STable) ->
     Table = list_to_atom(STable),
     dump_tables(Path, [Table]).
 
--spec dump_tables(file:name(), Tables :: [string()]) ->
+-spec dump_tables(file:name(), Tables :: [atom()]) ->
                         {'cannot_dump', io_lib:chars()} | {'ok', []}.
 dump_tables(Path, Tables) ->
     case dump_to_textfile(Path, Tables) of
@@ -535,19 +486,19 @@ dump_tables(Path, Tables) ->
             {cannot_dump, String}
     end.
 
--spec dump_to_textfile(file:name()) -> 'ok' | {'error',atom()}.
+-spec dump_to_textfile(file:name()) -> 'ok' | {'error', atom()}.
 dump_to_textfile(File) ->
     Tabs = get_local_tables(),
     dump_to_textfile(File, Tabs).
 
--spec dump_to_textfile(file:name(), Tabs :: list()) -> 'ok' | {'error',atom()}.
+-spec dump_to_textfile(file:name(), Tabs :: list()) -> 'ok' | {'error', atom()}.
 dump_to_textfile(File, Tabs) ->
     dump_to_textfile(mnesia:system_info(is_running), Tabs, file:open(File, [write])).
 
 -spec dump_to_textfile(any(),
                       any(),
-                      {'error',atom()} | {'ok',pid() | {'file_descriptor',atom() | tuple(),_}}
-                      ) -> 'ok' | {'error',atom()}.
+                      {'error', atom()} | {'ok', pid() | {'file_descriptor', atom() | tuple(), _}}
+                      ) -> 'ok' | {'error', atom()}.
 dump_to_textfile(yes, Tabs, {ok, F}) ->
     Defs = lists:map(
              fun(T) -> {T, [{record_name, mnesia:table_info(T, record_name)},
@@ -563,13 +514,13 @@ dump_to_textfile(_, _, {ok, F}) ->
 dump_to_textfile(_, _, {error, Reason}) ->
     {error, Reason}.
 
--spec dump_tab(pid(),atom()) -> 'ok'.
+-spec dump_tab(pid(), atom()) -> 'ok'.
 dump_tab(F, T) ->
     W = mnesia:table_info(T, wild_pattern),
-    {atomic,All} = mnesia:transaction(
+    {atomic, All} = mnesia:transaction(
                      fun() -> mnesia:match_object(T, W, read) end),
     lists:foreach(
-      fun(Term) -> io:format(F,"~p.~n", [setelement(1, Term, T)]) end, All).
+      fun(Term) -> io:format(F, "~p.~n", [setelement(1, Term, T)]) end, All).
 
 -spec load_mnesia(file:name()) -> {'cannot_load', io_lib:chars()} | {'ok', []}.
 load_mnesia(Path) ->
@@ -583,7 +534,7 @@ load_mnesia(Path) ->
     end.
 
 -spec install_fallback_mnesia(file:name()) ->
-                        {'cannot_fallback', io_lib:chars()} | {'ok',[]}.
+                        {'cannot_fallback', io_lib:chars()} | {'ok', []}.
 install_fallback_mnesia(Path) ->
     case mnesia:install_fallback(Path) of
         ok ->
@@ -594,7 +545,7 @@ install_fallback_mnesia(Path) ->
             {cannot_fallback, String}
     end.
 
--spec mnesia_change_nodename(string(),string(),_,_) -> {ok,_} | {error,_}.
+-spec mnesia_change_nodename(string(), string(), _, _) -> {ok, _} | {error, _}.
 mnesia_change_nodename(FromString, ToString, Source, Target) ->
     From = list_to_atom(FromString),
     To = list_to_atom(ToString),
@@ -615,7 +566,7 @@ mnesia_change_nodename(FromString, ToString, Source, Target) ->
         fun
             ({schema, db_nodes, Nodes}, Acc) ->
                 io:format(" +++ db_nodes ~p~n", [Nodes]),
-                {[{schema, db_nodes, lists:map(Switch,Nodes)}], Acc};
+                {[{schema, db_nodes, lists:map(Switch, Nodes)}], Acc};
             ({schema, version, Version}, Acc) ->
                 io:format(" +++ version: ~p~n", [Version]),
                 {[{schema, version, Version}], Acc};

@@ -26,23 +26,22 @@
 
 -module(ejabberd).
 -author('alexey@process-one.net').
-
+-xep([{xep, 212}, {version, "1.0"}]).
 -export([start/0,
          stop/0,
-         ensure_started/1,
          get_pid_file/0,
          get_so_path/0,
          get_bin_path/0]).
 
 -include("jlib.hrl").
 
--type lang() :: binary() | nonempty_string().
+-type lang() :: binary().
 
 -type sockmod() :: gen_tcp
                  | ejabberd_socket
                  | mod_bosh_socket
                  | mod_websockets
-                 | ejabberd_tls
+                 | fast_tls
                  | ejabberd_zlib.
 
 -type user()      :: binary().
@@ -63,8 +62,8 @@
 -type xml_stream_item() :: 'closed'
                           | 'timeout'
                           | {'xmlstreamelement', jlib:xmlel()}
-                          | {'xmlstreamend',_}
-                          | {'xmlstreamerror',_}
+                          | {'xmlstreamend', _}
+                          | {'xmlstreamerror', _}
                           | {'xmlstreamstart', Name :: any(), Attrs :: list()}.
 
 -export_type([lang/0,
@@ -77,31 +76,8 @@
               literal_jid/0
              ]).
 
--ifdef(only_builtin_types).
--type dict_t() :: dict().
--type queue_t() :: queue().
--type set_t() :: set().
--else.
--type dict_t() :: dict:dict().
--type queue_t() :: queue:queue().
--type set_t() :: set:set().
--endif.
-
--export_type([dict_t/0, queue_t/0, set_t/0]).
-
 start() ->
-    ensure_started(ejabberd).
-
-ensure_started(AppName) ->
-    case application:start(AppName) of
-        ok ->
-            ok;
-        {error, {already_started, AppName}} ->
-            ok;
-        {error, {not_started, AppName2}} ->
-            ok = ensure_started(AppName2),
-            ensure_started(AppName)
-    end.
+    application:ensure_all_started(ejabberd).
 
 stop() ->
     application:stop(ejabberd).

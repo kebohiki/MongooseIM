@@ -15,34 +15,35 @@
          rule_to_xmlel/1,
          strip_amp_el/1,
 
-         binaries_to_rule/3
+         binaries_to_rule/3,
+         is_amp_request/1
         ]).
 
 -export_type([amp_rule/0,
-             amp_rules/0]).
+              amp_rules/0]).
 
 
 -spec binaries_to_rule(binary(), binary(), binary()) -> amp_rule() | amp_invalid_rule().
-binaries_to_rule(<<"deliver">> = Condition, Value,Action) ->
-    case are_valid_deliver_params(Value,Action) of
+binaries_to_rule(<<"deliver">> = Condition, Value, Action) ->
+    case are_valid_deliver_params(Value, Action) of
         true -> mk_amp_rule('deliver', from_bin_(Value), from_bin_(Action));
         false -> mk_amp_invalid_rule(Condition, Value, Action)
     end;
-binaries_to_rule(<<"match-resource">> = Condition, Value,Action) ->
-    case are_valid_match_resource_params(Value,Action) of
+binaries_to_rule(<<"match-resource">> = Condition, Value, Action) ->
+    case are_valid_match_resource_params(Value, Action) of
         true -> mk_amp_rule('match-resource', from_bin_(Value), from_bin_(Action));
         false -> mk_amp_invalid_rule(Condition, Value, Action)
     end;
-binaries_to_rule(<<"expire-at">> = Condition, Value,Action) ->
-    case are_valid_expire_at_params(Value,Action) of
+binaries_to_rule(<<"expire-at">> = Condition, Value, Action) ->
+    case are_valid_expire_at_params(Value, Action) of
         true -> mk_amp_rule('expire-at', Value, from_bin_(Action)); %% Value is binary here!
         false -> mk_amp_invalid_rule(Condition, Value, Action)
     end;
-binaries_to_rule(Condition,Value,Action) ->
+binaries_to_rule(Condition, Value, Action) ->
     mk_amp_invalid_rule(Condition, Value, Action).
 
 
--spec extract_requested_rules(exml:xmlel()) -> 'none'
+-spec extract_requested_rules(#xmlel{}) -> 'none'
                                              | {rules, amp_rules()}
                                              | {errors, [{amp_error(), amp_invalid_rule()}]}.
 extract_requested_rules(#xmlel{} = Stanza) ->
@@ -51,10 +52,10 @@ extract_requested_rules(#xmlel{} = Stanza) ->
         _    -> none
     end.
 
--spec make_response(amp_rule(), jid(), exml:xmlel()) -> exml:xmlel().
+-spec make_response(amp_rule(), jid(), #xmlel{}) -> #xmlel{}.
 make_response(Rule, User, Packet) ->
     OriginalId = exml_query:attr(Packet, <<"id">>, <<"original-id-missing">>),
-    OriginalSender = jlib:jid_to_binary(User),
+    OriginalSender = jid:to_binary(User),
     OriginalRecipient = exml_query:attr(Packet, <<"to">>),
 
     Amp = #xmlel{name = <<"amp">>,
@@ -68,8 +69,8 @@ make_response(Rule, User, Packet) ->
            children = [Amp]}.
 
 
--spec make_error_response([amp_error()], [amp_any_rule()], jid(), exml:xmlel())
-                         -> exml:xmlel().
+-spec make_error_response([amp_error()], [amp_any_rule()], jid(), #xmlel{})
+                         -> #xmlel{}.
 make_error_response([E|_] = Errors, [_|_] = Rules, User, Packet) ->
     OriginalId = exml_query:attr(Packet, <<"id">>, <<"original-id-missing">>),
     Error = make_error_el(Errors, Rules),
@@ -81,23 +82,23 @@ make_error_response([E|_] = Errors, [_|_] = Rules, User, Packet) ->
            attrs = [{<<"id">>, OriginalId},
                     {<<"type">>, <<"error">>}],
            children = [Error, Amp]};
-make_error_response(Errors,Rules,User,Packet) ->
+make_error_response(Errors, Rules, User, Packet) ->
     ?ERROR_MSG("amp:make_error_response/4 got invalid data: ~p",
-               [Errors,Rules,User,Packet]),
+               [Errors, Rules, User, Packet]),
     error(invalid_data).
 
 error_amp_attrs('undefined-condition', User, Packet) ->
-    OriginalSender = jlib:jid_to_binary(User),
+    OriginalSender = jid:to_binary(User),
     OriginalRecipient = exml_query:attr(Packet, <<"to">>),
     [{<<"status">>, <<"error">>},
      {<<"to">>, OriginalRecipient},
      {<<"from">>, OriginalSender}];
-error_amp_attrs(_,_,_) -> [].
+error_amp_attrs(_, _, _) -> [].
 
 
 %% The lists are guaranteed to be non-empty and of equal
 %% length by make_error_message/4
--spec make_error_el([amp_error()],[amp_any_rule()]) -> exml:xmlel().
+-spec make_error_el([amp_error()], [amp_any_rule()]) -> #xmlel{}.
 make_error_el(Errors, Rules) ->
     ErrorMarker = #xmlel{name = error_marker_name(hd(Errors)),
                          attrs = [{<<"xmlns">>, ?NS_STANZAS}]},
@@ -109,7 +110,7 @@ make_error_el(Errors, Rules) ->
                     {<<"code">>, error_code(hd(Errors))}],
            children = [ErrorMarker, RuleContainer]}.
 
--spec rule_to_xmlel(amp_any_rule()) -> exml:xmlel().
+-spec rule_to_xmlel(amp_any_rule()) -> #xmlel{}.
 rule_to_xmlel(#amp_rule{condition=C, value=V, action=A}) ->
     #xmlel{name = <<"rule">>,
            attrs = [{<<"condition">>, to_bin_(C)},
@@ -118,10 +119,10 @@ rule_to_xmlel(#amp_rule{condition=C, value=V, action=A}) ->
 rule_to_xmlel(#amp_invalid_rule{condition=C, value=V, action=A}) ->
     #xmlel{name = <<"rule">>,
            attrs = [{<<"condition">>, C},
-                    {<<"value">>,V},
+                    {<<"value">>, V},
                     {<<"action">>, A}]}.
 
--spec strip_amp_el(exml:xmlel()) -> exml:xmlel().
+-spec strip_amp_el(#xmlel{}) -> #xmlel{}.
 strip_amp_el(#xmlel{children = Children} = Elem) ->
     NewChildren = [ C || C <- Children, not is_amp_el(C) ],
     Elem#xmlel{children = NewChildren}.
@@ -132,7 +133,7 @@ strip_amp_el(#xmlel{children = Children} = Elem) ->
 %%      but filter out server->client AMPed responses.
 %%      We can distinguish them by the fact that s2c messages MUST have
 %%      a 'status' attr on the <amp> element.
--spec is_amp_request(exml:xmlel()) -> boolean().
+-spec is_amp_request(#xmlel{}) -> boolean().
 is_amp_request(Stanza) ->
     Amp = exml_query:subelement(Stanza, <<"amp">>),
     (undefined =/= Amp)
@@ -141,11 +142,11 @@ is_amp_request(Stanza) ->
          andalso
          (undefined == exml_query:subelement(Stanza, <<"error">>)).
 
--spec is_amp_el(exml:xmlel()) -> boolean().
+-spec is_amp_el(#xmlel{}) -> boolean().
 is_amp_el(#xmlel{name = <<"amp">>}) -> true;
 is_amp_el(_)                        -> false.
 
--spec parse_rules(exml:xmlel()) -> none
+-spec parse_rules(#xmlel{}) -> none
                                  | {rules, amp_rules()}
                                  | {errors, [{amp_error(), amp_rule()}]}.
 parse_rules(Stanza) ->
@@ -158,10 +159,10 @@ parse_rules(Stanza) ->
         {_, Invalid} -> {errors, [ {'not-acceptable', R} || R <- Invalid ]}
     end.
 
--spec parse_rule(exml:xmlel()) -> amp_rule() | amp_invalid_rule().
+-spec parse_rule(#xmlel{}) -> amp_rule() | amp_invalid_rule().
 parse_rule(#xmlel{attrs = Attrs}) ->
-    GetF = fun(Value) -> proplists:get_value(Value,Attrs, <<"attribute-missing">>) end,
-    {C,V,A} = {GetF(<<"condition">>),
+    GetF = fun(Value) -> proplists:get_value(Value, Attrs, <<"attribute-missing">>) end,
+    {C, V, A} = {GetF(<<"condition">>),
                GetF(<<"value">>),
                GetF(<<"action">>)},
     binaries_to_rule(C, V, A).
@@ -185,9 +186,9 @@ are_valid_expire_at_params(_Value, Action) ->
     %% We may check the value with a regexp for a proper date in the future.
     is_valid_action(Action).
 
-mk_amp_rule(C,V,A) ->
+mk_amp_rule(C, V, A) ->
     #amp_rule{condition = C, value = V, action = A}.
-mk_amp_invalid_rule(C,V,A) ->
+mk_amp_invalid_rule(C, V, A) ->
     #amp_invalid_rule{condition = C, value = V, action = A}.
 
 error_code('not-acceptable')      -> <<"405">>;

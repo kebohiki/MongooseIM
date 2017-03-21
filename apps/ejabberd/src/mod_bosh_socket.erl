@@ -1,6 +1,7 @@
 -module(mod_bosh_socket).
 
 -behaviour(gen_fsm).
+-behaviour(mongoose_transport).
 
 %% API
 -export([start/2,
@@ -19,7 +20,6 @@
 %% ejabberd_socket compatibility
 -export([starttls/2, starttls/3,
          compress/1, compress/3,
-         reset_stream/1,
          send/2,
          send_xml/2,
          change_shaper/2,
@@ -43,7 +43,6 @@
 -include("jlib.hrl").
 -include_lib("exml/include/exml_stream.hrl").
 -include("mod_bosh.hrl").
-
 -define(ACCUMULATE_PERIOD, 10).
 -define(DEFAULT_HOLD, 1).
 -define(CONCURRENT_REQUESTS, 2).
@@ -54,8 +53,8 @@
 -type cached_response() :: {rid(), erlang:timestamp(), jlib:xmlel()}.
 -type rid() :: pos_integer().
 
--record(state, {from            :: binary(),
-                to              :: binary(),
+-record(state, {from            :: binary() | undefined,
+                to              :: binary() | undefined,
                 c2s_pid         :: pid(),
                 handlers = []   :: [{rid(), reference(), pid()}],
                 %% Elements buffered for sending to the client.
@@ -79,7 +78,7 @@
                 last_processed  :: rid() | 'undefined',
                 %% Report scheduled for sending at the earliest
                 %% possible occasion.
-                report = false  :: {rid(), timer:time()} | 'false'}).
+                report = false  :: {rid(), Time :: non_neg_integer()} | 'false'}).
 -type state() :: #state{}.
 
 -type statename() :: 'accumulate' | 'normal' | 'closing'.
@@ -90,12 +89,12 @@
 %%--------------------------------------------------------------------
 
 -spec start(mod_bosh:sid(), _) ->
-    {'error',_} | {'ok','undefined' | pid()} | {'ok','undefined' | pid(),_}.
+    {'error', _} | {'ok', 'undefined' | pid()} | {'ok', 'undefined' | pid(), _}.
 start(Sid, Peer) ->
     supervisor:start_child(?BOSH_SOCKET_SUP, [Sid, Peer]).
 
 
--spec start_link(mod_bosh:sid(),_) -> 'ignore' | {'error',_} | {'ok',pid()}.
+-spec start_link(mod_bosh:sid(), _) -> 'ignore' | {'error', _} | {'ok', pid()}.
 start_link(Sid, Peer) ->
     gen_fsm:start_link(?MODULE, [Sid, Peer], []).
 
@@ -236,7 +235,7 @@ closing(Event, State) ->
 %% @doc
 %% There should be one instance of this function for each possible
 %% state name. Whenever a gen_fsm receives an event sent using
-%% gen_fsm:sync_send_event/[2,3], the instance of this function with
+%% gen_fsm:sync_send_event/[2, 3], the instance of this function with
 %% the same name as the current state name StateName is called to
 %% handle the event.
 %%
@@ -311,7 +310,7 @@ determine_next_state(EventTag, SName, NNS) ->
 %% @private
 %% @doc
 %% Whenever a gen_fsm receives an event sent using
-%% gen_fsm:sync_send_all_state_event/[2,3], this function is called
+%% gen_fsm:sync_send_all_state_event/[2, 3], this function is called
 %% to handle the event.
 %%
 %% @spec handle_sync_event(Event, From, StateName, State) ->
@@ -351,7 +350,7 @@ handle_sync_event(Event, _From, StateName, State) ->
 %% message other than a synchronous or asynchronous event
 %% (or a system message).
 %%
-%% @spec handle_info(Info,StateName,State)->
+%% @spec handle_info(Info, StateName, State)->
 %%                   {next_state, NextStateName, NextState} |
 %%                   {next_state, NextStateName, NextState, Timeout} |
 %%                   {stop, Reason, NewState}
@@ -367,10 +366,6 @@ handle_info({send, Data}, accumulate = SName, #state{} = S) ->
 handle_info({send, Data}, normal = SName, #state{} = S) ->
     NS = send_or_store(Data, S),
     {next_state, SName, NS};
-handle_info(reset_stream, SName, #state{} = S) ->
-    %% TODO: actually reset the stream once it's stored per bosh session
-    ?DEBUG("Stream reset by c2s~n", []),
-    {next_state, SName, S};
 handle_info(close, _SName, #state{pending = []} = State) ->
     {stop, normal, State};
 handle_info(close, _SName, State) ->
@@ -397,7 +392,7 @@ handle_info(Info, SName, State) ->
 
 terminate(_Reason, StateName, #state{sid = Sid, handlers = Handlers} = S) ->
     [Pid ! {close, Sid} || {_, _, Pid} <- lists:sort(Handlers)],
-    ?BOSH_BACKEND:delete_session(Sid),
+    mod_bosh_backend:delete_session(Sid),
     catch ejabberd_c2s:stop(S#state.c2s_pid),
     ?DEBUG("Closing session ~p in '~s' state. Handlers: ~p Pending: ~p~n",
            [Sid, StateName, Handlers, S#state.pending]).
@@ -418,7 +413,7 @@ handle_stream_event({EventTag, Body, Rid} = Event, Handler,
                 is_expected_rid(Rid, ExpectedRid),
                 is_acceptable_rid(Rid, ExpectedRid)}
     of
-        {_, {true, CachedResponse}, _, _} ->
+        {_, {true, CachedResponse}, _, _} when Handler /= none ->
             case CachedResponse of
                 none ->
                     NS;
@@ -436,7 +431,7 @@ handle_stream_event({EventTag, Body, Rid} = Event, Handler,
         {_, _, false, false} ->
 
             ?ERROR_MSG("invalid rid ~p, expected ~p, difference ~p:~n~p~n",
-                       [Rid, ExpectedRid, maybe_diff(Rid,ExpectedRid),
+                       [Rid, ExpectedRid, maybe_diff(Rid, ExpectedRid),
                         {EventTag, Body}]),
             [Pid ! item_not_found
              || {_, _, Pid} <- lists:sort(NS#state.handlers)],
@@ -471,7 +466,7 @@ maybe_diff(Rid, Expected) -> abs(Rid-Expected).
 
 
 -spec resend_cached({Rid :: pos_integer(),
-                     {non_neg_integer(),non_neg_integer(),non_neg_integer()},
+                     {non_neg_integer(), non_neg_integer(), non_neg_integer()},
                      CachedBody :: jlib:xmlel()},
                     state()) -> state().
 resend_cached({_Rid, _, CachedBody}, S) ->
@@ -506,14 +501,14 @@ rid(#state{} = S, Rid) when is_integer(Rid), Rid > 0 ->
                               boolean(),
                               Rid :: rid(),
                               LastProcessed :: 'undefined' | pos_integer()
-                            ) -> {'noreport',_} | {'report',_}.
+                            ) -> {'noreport', _} | {'report', _}.
 determine_report_action(undefined, false, _, _) ->
     {noreport, undefined};
 determine_report_action(undefined, true, Rid, LastProcessed) ->
-    if
-        Rid+1 == LastProcessed ->
+    case Rid+1 == LastProcessed of
+        true ->
             {noreport, undefined};
-        Rid+1 /= LastProcessed ->
+        false ->
             ?WARNING_MSG("expected 'ack' attribute on ~p~n", [Rid]),
             {noreport, undefined}
     end;
@@ -541,7 +536,7 @@ is_valid_ack(_, _) ->
 maybe_trim_cache(undefined, S) ->
     S;
 maybe_trim_cache(Ack, S) ->
-    UpToAck = fun({R,_,_}) when R =< Ack ->
+    UpToAck = fun({R, _, _}) when R =< Ack ->
                     true;
                  (_) ->
                     false
@@ -619,13 +614,13 @@ process_deferred_events(SName, #state{deferred = Deferred} = S) ->
                 lists:sort(Deferred)).
 
 
--spec is_expected_rid(rid(), rid()) -> boolean().
+-spec is_expected_rid(rid(), rid() | undefined) -> boolean().
 is_expected_rid(Rid, ExpectedRid) when Rid == ExpectedRid ->
     true;
 is_expected_rid(_, _) ->
     false.
 
--spec is_acceptable_rid(rid(), rid()) -> boolean().
+-spec is_acceptable_rid(rid(), rid() | undefined) -> boolean().
 is_acceptable_rid(Rid, ExpectedRid)
   when Rid > ExpectedRid,
        Rid < ExpectedRid + ?CONCURRENT_REQUESTS ->
@@ -665,7 +660,7 @@ pick_handler(#state{handlers = Handlers} = S) ->
     {{Rid, Pid}, S#state{handlers = HRest}}.
 
 
--spec send_to_handler({_, atom() | pid() | port() | {atom(),atom()}},
+-spec send_to_handler({_, atom() | pid() | port() | {atom(), atom()}},
                       Wrapped :: [any()] | jlib:xmlel(),
                       State :: state() ) -> state().
 send_to_handler({_, Pid}, #xmlel{name = <<"body">>} = Wrapped, State) ->
@@ -679,7 +674,7 @@ send_to_handler({Rid, Pid}, Data, State) ->
 %% @doc This is the most specific variant of send_to_handler()
 %% and the *only one* actually performing a send
 %% to the cowboy_loop_handler serving a HTTP request.
--spec send_wrapped_to_handler(atom() | pid() | port() | {atom(),atom()},
+-spec send_wrapped_to_handler(atom() | pid() | port() | {atom(), atom()},
                               Wrapped :: jlib:xmlel(),
                               State :: state()) -> state().
 send_wrapped_to_handler(Pid, Wrapped, #state{handlers = []} = State) ->
@@ -690,17 +685,17 @@ send_wrapped_to_handler(Pid, Wrapped, State) ->
     State.
 
 
--spec maybe_ack(rid(), state()) -> [{binary(),_}].
+-spec maybe_ack(rid(), state()) -> [{binary(), _}].
 maybe_ack(HandlerRid, #state{rid = Rid} = S) ->
-    if
-        Rid > HandlerRid ->
+    case Rid > HandlerRid of
+        true ->
             server_ack(S#state.server_acks, Rid);
-        Rid =< HandlerRid ->
+        false ->
             []
     end.
 
 
--spec maybe_report(state()) -> {[{binary(),_}], state()}.
+-spec maybe_report(state()) -> {[{binary(), _}], state()}.
 maybe_report(#state{report = false} = S) ->
     {[], S};
 maybe_report(#state{report = Report} = S) ->
@@ -711,7 +706,7 @@ maybe_report(#state{report = Report} = S) ->
 
 
 -spec cache_response({rid(), erlang:timestamp(), jlib:xmlel()}, state()) -> state().
-cache_response({Rid,_,_} = Response, #state{sent = Sent} = S) ->
+cache_response({Rid, _, _} = Response, #state{sent = Sent} = S) ->
     NewSent = lists:keymerge(1, [Response], Sent),
     CacheUpTo = case S#state.client_acks of
         true ->
@@ -734,7 +729,7 @@ cache_up_to(N, Responses) ->
     lists:nthtail(max(0, length(Responses) - N), Responses).
 
 
--spec last_processed(rid(),'undefined' | pos_integer()) -> rid().
+-spec last_processed(rid(), 'undefined' | pos_integer()) -> rid().
 last_processed(Rid, undefined) ->
     Rid;
 last_processed(Rid1, Rid2) ->
@@ -840,9 +835,7 @@ bosh_unwrap(normal, Body, #state{sid = Sid} = State) ->
      State}.
 
 
--spec get_client_acks('restart' | 'streamstart', jlib:xmlel(), boolean()) -> boolean().
-get_client_acks(restart, _, Default) ->
-    Default;
+-spec get_client_acks(streamstart, jlib:xmlel(), boolean()) -> boolean().
 get_client_acks(streamstart, Element, Default) ->
     case exml_query:attr(Element, <<"ack">>) of
         undefined ->
@@ -897,7 +890,8 @@ bosh_wrap(Elements, Rid, #state{} = S) ->
     end,
     MaybeAck = maybe_ack(Rid, NS),
     {MaybeReport, NNS} = maybe_report(NS),
-    MaybeStreamPrefix = maybe_stream_prefix(Children),
+    HasStreamPrefix = (exml_query:attr(Body, <<"xmlns:stream">>) /= undefined),
+    MaybeStreamPrefix = maybe_stream_prefix(HasStreamPrefix, Children),
     ExtraAttrs = MaybeAck ++ MaybeReport ++ MaybeStreamPrefix,
     {Body#xmlel{attrs = Body#xmlel.attrs ++ ExtraAttrs,
                 children = maybe_add_default_ns_to_children(Children)}, NNS}.
@@ -922,7 +916,7 @@ bosh_stream_start_body(#xmlstreamstart{attrs = Attrs}, #state{} = S) ->
                     {<<"hold">>, integer_to_binary(S#state.hold)},
                     {<<"from">>, proplists:get_value(<<"from">>, Attrs)},
                     %% TODO: how to support these with cowboy?
-                    {<<"accept">>, <<"deflate,gzip">>},
+                    {<<"accept">>, <<"deflate, gzip">>},
                     {<<"sid">>, S#state.sid},
                     {<<"xmpp:restartlogic">>, <<"true">>},
                     {<<"xmpp:version">>, <<"1.0">>},
@@ -936,18 +930,18 @@ bosh_stream_start_body(#xmlstreamstart{attrs = Attrs}, #state{} = S) ->
            children = []}.
 
 
--spec inactivity('infinity' | 'undefined' | pos_integer()) -> [{binary(),_}].
+-spec inactivity('infinity' | 'undefined' | pos_integer()) -> [{binary(), _}].
 inactivity(I) ->
     [{<<"inactivity">>, integer_to_binary(I)} || is_integer(I)].
 
 
--spec maxpause('undefined' | pos_integer()) -> [{binary(),_}].
+-spec maxpause('undefined' | pos_integer()) -> [{binary(), _}].
 maxpause(MP) ->
     [{<<"maxpause">>, integer_to_binary(MP)} || is_integer(MP)].
 
 
--spec server_ack('false' | 'true' | 'undefined','undefined' | rid())
-            -> [{binary(),_}].
+-spec server_ack('false' | 'true' | 'undefined', 'undefined' | rid())
+            -> [{binary(), _}].
 server_ack(ServerAcks, Rid) ->
     [{<<"ack">>, integer_to_binary(Rid)} || ServerAcks =:= true].
 
@@ -968,50 +962,46 @@ bosh_stream_end_body() ->
                     {<<"xmlns">>, ?NS_HTTPBIND}],
            children = []}.
 
-maybe_stream_prefix(Stanzas) ->
-    case lists:any(fun is_stream_error/1, Stanzas) of
+maybe_stream_prefix(true, _) ->
+    [];
+maybe_stream_prefix(_, Stanzas) ->
+    case lists:any(fun is_stream_prefix/1, Stanzas) of
         false ->
             [];
         true ->
             [{<<"xmlns:stream">>, ?NS_STREAM}]
     end.
 
-is_stream_error(#xmlel{name = Name}) ->
-    Name =:= <<"stream:error">>.
+is_stream_prefix(#xmlel{name = <<"stream:error">>}) -> true;
+is_stream_prefix(#xmlel{name = <<"stream:features">>}) -> true;
+is_stream_prefix(_) -> false.
 
 %%--------------------------------------------------------------------
 %% ejabberd_socket compatibility
 %%--------------------------------------------------------------------
 
 %% @doc Should be negotiated on HTTP level.
--spec starttls(mod_bosh:socket(), _) -> none().
+-spec starttls(mod_bosh:socket(), _) -> no_return().
 starttls(SocketData, TLSOpts) ->
     starttls(SocketData, TLSOpts, <<>>).
 
 
--spec starttls(mod_bosh:socket(), _, _) -> none().
+-spec starttls(mod_bosh:socket(), _, _) -> no_return().
 starttls(_SocketData, _TLSOpts, _Data) ->
     throw({error, negotiate_tls_on_http_level}).
 
 
 %% @doc Should be negotiated on HTTP level.
--spec compress(mod_bosh:socket()) -> none().
+-spec compress(mod_bosh:socket()) -> no_return().
 compress(SocketData) ->
     compress(SocketData, <<>>, 0).
 
--spec compress(mod_bosh:socket(), _, integer()) -> none().
+-spec compress(mod_bosh:socket(), _, integer()) -> no_return().
 compress(_SocketData, _Data, _InflateSizeLimit) ->
     throw({error, negotiate_compression_on_http_level}).
 
 
-%% @doc TODO: adjust for BOSH
--spec reset_stream(mod_bosh:socket()) -> mod_bosh:socket().
-reset_stream(#bosh_socket{pid = Pid} = SocketData) ->
-    Pid ! reset_stream,
-    SocketData.
-
-
--spec send_xml(mod_bosh:socket(), jlib:xmlstreamel()) -> 'ok'.
+-spec send_xml(mod_bosh:socket(), mongoose_transport:send_xml_input()) -> ok.
 send_xml(Socket, {xmlstreamelement, XML}) ->
     send(Socket, XML);
 send_xml(Socket, #xmlstreamstart{} = XML) ->
@@ -1022,7 +1012,7 @@ send_xml(Socket, #xmlstreamend{} = XML) ->
 
 -spec send(mod_bosh:socket(), _) -> 'ok'.
 send(#bosh_socket{pid = Pid}, Data) ->
-    Pid ! {send, xml:escape_cdata_and_attr(Data)},
+    Pid ! {send, Data},
     ok.
 
 -spec change_shaper(mod_bosh:socket(), shaper:shaper()) -> mod_bosh:socket().
@@ -1045,7 +1035,7 @@ get_sockmod(_SocketData) ->
 close(#bosh_socket{pid = Pid}) ->
     Pid ! close.
 
--spec peername(mod_bosh:socket()) -> {ok, {inet:ip_address(), inet:port_number()}}.
+-spec peername(mod_bosh:socket()) -> mongoose_transport:peername_return().
 peername(#bosh_socket{peer = Peer}) ->
     {ok, Peer}.
 
@@ -1055,7 +1045,7 @@ peername(#bosh_socket{peer = Peer}) ->
 
 %% @doc Set Fields of the Record to Values,
 %% when {Field, Value} <- FieldValues (in list comprehension syntax).
--spec record_set(state(), [{6 | 7 | 10, _},...]) -> state().
+-spec record_set(state(), [{pos_integer(), _}, ...]) -> state().
 record_set(Record, FieldValues) ->
     F = fun({Field, Value}, Rec) ->
             setelement(Field, Rec, Value)
@@ -1086,6 +1076,6 @@ maybe_add_default_ns(El) ->
 -include_lib("eunit/include/eunit.hrl").
 
 cache_up_to_test_() ->
-    [?_test(?assertEqual( [4,5], cache_up_to(2, [1,2,3,4,5]) ))].
+    [?_test(?assertEqual( [4, 5], cache_up_to(2, [1, 2, 3, 4, 5]) ))].
 
 -endif.

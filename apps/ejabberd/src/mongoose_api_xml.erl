@@ -17,7 +17,7 @@
 
 -behaviour(mongoose_api_format).
 
--export([serialize/1]).
+-export([serialize/1, deserialize/1]).
 
 -include("ejabberd.hrl").
 -include_lib("exml/include/exml.hrl").
@@ -28,20 +28,23 @@
 serialize(Data) ->
     do_serialize(Data).
 
+deserialize(IOList) ->
+    {ok, ParsedXML} = exml:parse(iolist_to_binary([IOList])),
+    ParsedXML.
+
 %%--------------------------------------------------------------------
 %% internal functions
 %%--------------------------------------------------------------------
 do_serialize(Data) ->
     exml:to_iolist(prepare_xmlel(Data)).
 
+prepare_xmlel(List) when is_list(List) ->
+    prepare_xmlel({<<"list">>, List});
 prepare_xmlel({ElementName, List}) when is_list(List) ->
     {Attrs, Children} = lists:partition(fun is_attribute/1, List),
     #xmlel{name = to_iolist_compliant(ElementName),
            attrs = [prepare_xmlel(Attr) || Attr <- Attrs],
            children = [prepare_xmlel(Child) || Child <- Children]};
-prepare_xmlel(List) when is_list(List) ->
-    #xmlel{name = <<"list">>,
-           children = [prepare_xmlel(Element) || Element <- List]};
 prepare_xmlel({Key, Value}) ->
     {to_iolist_compliant(Key), to_iolist_compliant(Value)};
 prepare_xmlel(Other) ->

@@ -20,23 +20,23 @@
 %% API
 -export([init/2,
          get_last/2,
-         count_active_users/3,
+         count_active_users/2,
          set_last_info/4,
          remove_user/2]).
 
--spec init(ejabberd:server(), list()) -> no_return().
+-spec init(ejabberd:server(), list()) -> ok.
 init(_Host, _Opts) ->
     ok.
 
 -spec get_last(ejabberd:luser(), ejabberd:lserver()) ->
     {ok, non_neg_integer(), binary()} | {error, term()} | not_found.
 get_last(LUser, LServer) ->
-    Username = ejabberd_odbc:escape(LUser),
-    case catch odbc_queries:get_last(LServer, Username) of
-        {selected, [<<"seconds">>, <<"state">>], []} ->
+    Username = mongoose_rdbms:escape(LUser),
+    case catch rdbms_queries:get_last(LServer, Username) of
+        {selected, []} ->
             not_found;
-        {selected, [<<"seconds">>, <<"state">>], [{STimeStamp, Status}]} ->
-            case catch ejabberd_odbc:result_to_integer(STimeStamp) of
+        {selected, [{STimeStamp, Status}]} ->
+            case catch mongoose_rdbms:result_to_integer(STimeStamp) of
                 TimeStamp when is_integer(TimeStamp) ->
                     {ok, TimeStamp, Status};
                 Reason ->
@@ -45,29 +45,32 @@ get_last(LUser, LServer) ->
         Reason -> {error, {invalid_result, Reason}}
     end.
 
--spec count_active_users(ejabberd:lserver(), non_neg_integer(), '<' | '>') ->
-    non_neg_integer().
-count_active_users(LServer, TimeStamp, Comparator) ->
-    ComparatorBin = atom_to_binary(Comparator, utf8),
+-spec count_active_users(ejabberd:lserver(), non_neg_integer()) -> non_neg_integer().
+count_active_users(LServer, TimeStamp) ->
     TimeStampBin = integer_to_binary(TimeStamp),
-    WhereClause = <<"where seconds ", ComparatorBin/binary, " ", TimeStampBin/binary >>,
-    case odbc_queries:count_records_where(LServer, <<"last">>, WhereClause) of
-        {selected, [_], [{Count}]} ->
-            ejabberd_odbc:result_to_integer(Count);
+    WhereClause = <<"where seconds > ", TimeStampBin/binary >>,
+    case rdbms_queries:count_records_where(LServer, <<"last">>, WhereClause) of
+        {selected, [{Count}]} ->
+            mongoose_rdbms:result_to_integer(Count);
         _ ->
             0
     end.
 
 -spec set_last_info(ejabberd:luser(), ejabberd:lserver(),
                     non_neg_integer(), binary()) ->
-    {atomic, ok} | {error, term()}.
+    ok | {error, term()}.
 set_last_info(LUser, LServer, TimeStamp, Status) ->
-    Username = ejabberd_odbc:escape(LUser),
-    Seconds = ejabberd_odbc:escape(integer_to_binary(TimeStamp)),
-    State = ejabberd_odbc:escape(Status),
-    odbc_queries:set_last_t(LServer, Username, Seconds, State).
+    Username = mongoose_rdbms:escape(LUser),
+    Seconds = mongoose_rdbms:escape(integer_to_binary(TimeStamp)),
+    State = mongoose_rdbms:escape(Status),
+    wrap_odbc_result(rdbms_queries:set_last_t(LServer, Username, Seconds, State)).
 
--spec remove_user(ejabberd:luser(), ejabberd:lserver()) -> ok.
+-spec remove_user(ejabberd:luser(), ejabberd:lserver()) -> ok | {error, term()}.
 remove_user(LUser, LServer) ->
-    Username = ejabberd_odbc:escape(LUser),
-    odbc_queries:del_last(LServer, Username).
+    Username = mongoose_rdbms:escape(LUser),
+    wrap_odbc_result(rdbms_queries:del_last(LServer, Username)).
+
+-spec wrap_odbc_result({error, term()} | any()) -> ok | {error, term()}.
+wrap_odbc_result({error, _} = Error) -> Error;
+wrap_odbc_result(_) -> ok.
+

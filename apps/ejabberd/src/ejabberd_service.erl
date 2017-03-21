@@ -26,10 +26,10 @@
 
 -module(ejabberd_service).
 -author('alexey@process-one.net').
+-xep([{xep, 114}, {version, "1.6"}]).
 
--define(GEN_FSM, p1_fsm).
-
--behaviour(?GEN_FSM).
+-behaviour(p1_fsm).
+-behaviour(mongoose_packet_handler).
 
 %% External exports
 -export([start/2,
@@ -48,16 +48,21 @@
          code_change/4,
          handle_info/3,
          terminate/3,
-     print_state/1]).
+         print_state/1]).
+
+%% packet handler callback
+-export([process_packet/4]).
 
 -include("ejabberd.hrl").
 -include("jlib.hrl").
 
 -record(state, {socket,
-                sockmod     :: ejabberd:sockmod(),
+                sockmod      :: ejabberd:sockmod(),
+                socket_monitor,
                 streamid,
-                hosts       :: list(),
-                password    :: binary(),
+                password     :: binary(),
+                host         :: binary() | undefined,
+                is_subdomain :: boolean(),
                 access,
                 check_from
               }).
@@ -105,26 +110,36 @@
        ).
 
 -define(INVALID_XML_ERR,
-        xml:element_to_binary(?SERR_XML_NOT_WELL_FORMED)).
+        exml:to_binary(?SERR_XML_NOT_WELL_FORMED)).
 -define(INVALID_NS_ERR,
-        xml:element_to_binary(?SERR_INVALID_NAMESPACE)).
+        exml:to_binary(?SERR_INVALID_NAMESPACE)).
+-define(CONFLICT_ERR,
+        exml:to_binary(?SERR_CONFLICT)).
 
 %%%----------------------------------------------------------------------
 %%% API
 %%%----------------------------------------------------------------------
--spec start(_,_) -> {'error',_} | {'ok','undefined' | pid()} | {'ok','undefined' | pid(),_}.
+-spec start(_, _) -> {'error', _} | {'ok', 'undefined' | pid()} | {'ok', 'undefined' | pid(), _}.
 start(SockData, Opts) ->
     supervisor:start_child(ejabberd_service_sup, [SockData, Opts]).
 
 
--spec start_link(_, list()) -> 'ignore' | {'error',_} | {'ok',pid()}.
+-spec start_link(_, list()) -> 'ignore' | {'error', _} | {'ok', pid()}.
 start_link(SockData, Opts) ->
-    ?GEN_FSM:start_link(ejabberd_service, [SockData, Opts],
+    p1_fsm:start_link(ejabberd_service, [SockData, Opts],
                         fsm_limit_opts(Opts) ++ ?FSMOPTS).
 
 
 socket_type() ->
     xml_stream.
+
+%%%----------------------------------------------------------------------
+%%% mongoose_packet_handler callback
+%%%----------------------------------------------------------------------
+
+-spec process_packet(From :: jid(), To :: jid(), Packet :: exml:element(), Pid :: pid()) -> any().
+process_packet(From, To, Packet, Pid) ->
+    Pid ! {route, From, To, Packet}.
 
 %%%----------------------------------------------------------------------
 %%% Callback functions from gen_fsm
@@ -137,38 +152,14 @@ socket_type() ->
 %%          ignore                              |
 %%          {stop, StopReason}
 %%----------------------------------------------------------------------
--spec init([list() | {atom() | tuple(),_},...]) -> {'ok','wait_for_stream',state()}.
+-spec init([list() | {atom() | tuple(), _}, ...]) -> {'ok', 'wait_for_stream', state()}.
 init([{SockMod, Socket}, Opts]) ->
     ?INFO_MSG("(~w) External service connected", [Socket]),
     Access = case lists:keysearch(access, 1, Opts) of
                  {value, {_, A}} -> A;
                  _ -> all
              end,
-    {Hosts, Password} =
-        case lists:keysearch(hosts, 1, Opts) of
-            {value, {_, Hs, HOpts}} ->
-                case lists:keysearch(password, 1, HOpts) of
-                    {value, {_, P}} ->
-                        {Hs, P};
-                    _ ->
-                        % TODO: generate error
-                        false
-                end;
-            _ ->
-                case lists:keysearch(host, 1, Opts) of
-                    {value, {_, H, HOpts}} ->
-                        case lists:keysearch(password, 1, HOpts) of
-                            {value, {_, P}} ->
-                                {[H], P};
-                            _ ->
-                                % TODO: generate error
-                                false
-                        end;
-                    _ ->
-                        % TODO: generate error
-                        false
-                end
-        end,
+    {password, Password} = lists:keyfind(password, 1, Opts),
     Shaper = case lists:keysearch(shaper_rule, 1, Opts) of
                  {value, {_, S}} -> S;
                  _ -> none
@@ -178,13 +169,15 @@ init([{SockMod, Socket}, Opts]) ->
                  _ -> true
              end,
     SockMod:change_shaper(Socket, Shaper),
+    SocketMonitor = SockMod:monitor(Socket),
     {ok, wait_for_stream, #state{socket = Socket,
                                  sockmod = SockMod,
+                                 socket_monitor = SocketMonitor,
                                  streamid = new_id(),
-                                 hosts = [iolist_to_binary(H) || H <- Hosts],
                                  password = Password,
                                  access = Access,
-                                 check_from = CheckFrom
+                                 check_from = CheckFrom,
+                                 is_subdomain = false
                                  }}.
 
 %%----------------------------------------------------------------------
@@ -203,10 +196,15 @@ wait_for_stream({xmlstreamstart, _Name, Attrs}, StateData) ->
             %% However several transports don't respect that,
             %% so ejabberd doesn't check 'to' attribute (EJAB-717)
             To = xml:get_attr_s(<<"to">>, Attrs),
-            Header = io_lib:format(?STREAM_HEADER,
-                                   [StateData#state.streamid, xml:crypt(To)]),
-            send_text(StateData, Header),
-            {next_state, wait_for_handshake, StateData};
+            Header = io_lib:format(?STREAM_HEADER, [StateData#state.streamid, To]),
+            IsSubdomain = case xml:get_attr_s(<<"is_subdomain">>, Attrs) of
+                <<"true">> -> true;
+                _          -> false
+            end,
+            send_text(StateData, list_to_binary(Header)),
+            StateData1 = StateData#state{host = To,
+                                         is_subdomain = IsSubdomain},
+            {next_state, wait_for_handshake, StateData1};
         _ ->
             send_text(StateData, ?INVALID_HEADER_ERR),
             {stop, normal, StateData}
@@ -214,8 +212,8 @@ wait_for_stream({xmlstreamstart, _Name, Attrs}, StateData) ->
 wait_for_stream({xmlstreamerror, _}, StateData) ->
     Header = io_lib:format(?STREAM_HEADER,
                            [<<"none">>, ?MYNAME]),
-    send_text(StateData,<<(iolist_to_binary(Header))/binary,
-                           (?INVALID_XML_ERR)/binary,(?STREAM_TRAILER)/binary>>),
+    send_text(StateData, <<(iolist_to_binary(Header))/binary,
+                           (?INVALID_XML_ERR)/binary, (?STREAM_TRAILER)/binary>>),
     {stop, normal, StateData};
 wait_for_stream(closed, StateData) ->
     {stop, normal, StateData}.
@@ -229,13 +227,15 @@ wait_for_handshake({xmlstreamelement, El}, StateData) ->
             case sha:sha1_hex(StateData#state.streamid ++
                          StateData#state.password) of
                 Digest ->
-                    send_text(StateData, <<"<handshake/>">>),
-                    lists:foreach(
-                      fun(H) ->
-                              ejabberd_router:register_route(H),
-                              ?INFO_MSG("Route registered for service ~p~n", [H])
-                      end, StateData#state.hosts),
-                    {next_state, stream_established, StateData};
+                    case register_routes(StateData) of
+                        ok ->
+                            send_text(StateData, <<"<handshake/>">>),
+                            {next_state, stream_established, StateData};
+                        {error, Reason} ->
+                            ?ERROR_MSG("Error in component handshake: ~p", [Reason]),
+                            send_text(StateData, ?CONFLICT_ERR),
+                            {stop, normal, StateData}
+                    end;
                 _ ->
                     send_text(StateData, ?INVALID_HANDSHAKE_ERR),
                     {stop, normal, StateData}
@@ -246,11 +246,10 @@ wait_for_handshake({xmlstreamelement, El}, StateData) ->
 wait_for_handshake({xmlstreamend, _Name}, StateData) ->
     {stop, normal, StateData};
 wait_for_handshake({xmlstreamerror, _}, StateData) ->
-    send_text(StateData,<<(?INVALID_XML_ERR)/binary,(?STREAM_TRAILER)/binary>>),
+    send_text(StateData, <<(?INVALID_XML_ERR)/binary, (?STREAM_TRAILER)/binary>>),
     {stop, normal, StateData};
 wait_for_handshake(closed, StateData) ->
     {stop, normal, StateData}.
-
 
 -spec stream_established(ejabberd:xml_stream_item(), state()) -> fsm_return().
 stream_established({xmlstreamelement, El}, StateData) ->
@@ -262,13 +261,13 @@ stream_established({xmlstreamelement, El}, StateData) ->
                   %% when accept packets from any address.
                   %% In this case, the component can send packet of
                   %% behalf of the server users.
-                  false -> jlib:binary_to_jid(From);
+                  false -> jid:from_binary(From);
                   %% The default is the standard behaviour in XEP-0114
                   _ ->
-                      FromJID1 = jlib:binary_to_jid(From),
+                      FromJID1 = jid:from_binary(From),
                       case FromJID1 of
                           #jid{lserver = Server} ->
-                              case lists:member(Server, StateData#state.hosts) of
+                              case Server =:= StateData#state.host of
                                   true -> FromJID1;
                                   false -> error
                               end;
@@ -278,7 +277,7 @@ stream_established({xmlstreamelement, El}, StateData) ->
     To = xml:get_attr_s(<<"to">>, Attrs),
     ToJID = case To of
                 <<>> -> error;
-                _ -> jlib:binary_to_jid(To)
+                _ -> jid:from_binary(To)
             end,
     if ((Name == <<"iq">>) or
         (Name == <<"message">>) or
@@ -296,7 +295,7 @@ stream_established({xmlstreamend, _Name}, StateData) ->
     % TODO ??
     {stop, normal, StateData};
 stream_established({xmlstreamerror, _}, StateData) ->
-    send_text(StateData, <<(?INVALID_XML_ERR)/binary,(?STREAM_TRAILER)/binary>>),
+    send_text(StateData, <<(?INVALID_XML_ERR)/binary, (?STREAM_TRAILER)/binary>>),
     {stop, normal, StateData};
 stream_established(closed, StateData) ->
     % TODO ??
@@ -357,17 +356,20 @@ handle_info({send_element, El}, StateName, StateData) ->
 handle_info({route, From, To, Packet}, StateName, StateData) ->
     case acl:match_rule(global, StateData#state.access, From) of
         allow ->
-           #xmlel{name =Name, attrs = Attrs,children = Els} = Packet,
-            Attrs2 = jlib:replace_from_to_attrs(jlib:jid_to_binary(From),
-                                                jlib:jid_to_binary(To),
-                                                Attrs),
-            Text = xml:element_to_binary( #xmlel{name = Name, attrs = Attrs2,children = Els}),
-            send_text(StateData, Text);
+           #xmlel{name =Name, attrs = Attrs, children = Els} = Packet,
+           Attrs2 = jlib:replace_from_to_attrs(jid:to_binary(From),
+                                               jid:to_binary(To),
+                                               Attrs),
+           Text = exml:to_binary(#xmlel{name = Name, attrs = Attrs2, children = Els}),
+           send_text(StateData, Text);
         deny ->
             Err = jlib:make_error_reply(Packet, ?ERR_NOT_ALLOWED),
             ejabberd_router:route_error(To, From, Err, Packet)
     end,
     {next_state, StateName, StateData};
+handle_info({'DOWN', Monitor, _Type, _Object, _Info}, _StateName, StateData)
+  when Monitor == StateData#state.socket_monitor ->
+    {stop, normal, StateData};
 handle_info(Info, StateName, StateData) ->
     ?ERROR_MSG("Unexpected info: ~p", [Info]),
     {next_state, StateName, StateData}.
@@ -382,10 +384,7 @@ terminate(Reason, StateName, StateData) ->
     ?INFO_MSG("terminated: ~p", [Reason]),
     case StateName of
         stream_established ->
-            lists:foreach(
-              fun(H) ->
-                      ejabberd_router:unregister_route(H)
-              end, StateData#state.hosts);
+            unregister_routes(StateData);
         _ ->
             ok
     end,
@@ -411,7 +410,7 @@ send_text(StateData, Text) ->
 
 -spec send_element(state(), jlib:xmlel()) -> binary().
 send_element(StateData, El) ->
-    send_text(StateData, xml:element_to_binary(El)).
+    send_text(StateData, exml:to_binary(El)).
 
 
 -spec new_id() -> string().
@@ -419,7 +418,7 @@ new_id() ->
     randoms:get_string().
 
 
--spec fsm_limit_opts(maybe_improper_list()) -> [{'max_queue',integer()}].
+-spec fsm_limit_opts(maybe_improper_list()) -> [{'max_queue', integer()}].
 fsm_limit_opts(Opts) ->
     case lists:keysearch(max_fsm_queue, 1, Opts) of
         {value, {_, N}} when is_integer(N) ->
@@ -433,3 +432,22 @@ fsm_limit_opts(Opts) ->
             end
     end.
 
+-spec register_routes(state()) -> any().
+register_routes(#state{host=Subdomain, is_subdomain=true}) ->
+    Hosts = ejabberd_config:get_global_option(hosts),
+    Routes = component_routes(Subdomain, Hosts),
+    ejabberd_router:register_components(Routes, mongoose_packet_handler:new(?MODULE, self()));
+register_routes(#state{host=Host}) ->
+    ejabberd_router:register_component(Host, mongoose_packet_handler:new(?MODULE, self())).
+
+-spec unregister_routes(state()) -> any().
+unregister_routes(#state{host=Subdomain, is_subdomain=true}) ->
+    Hosts = ejabberd_config:get_global_option(hosts),
+    Routes = component_routes(Subdomain, Hosts),
+    ejabberd_router:unregister_components(Routes);
+unregister_routes(#state{host=Host}) ->
+    ejabberd_router:unregister_component(Host).
+
+-spec component_routes(binary(), [binary()]) -> [binary()].
+component_routes(Subdomain, Hosts) ->
+    [<<Subdomain/binary, ".", Host/binary>> || Host <- Hosts].

@@ -56,7 +56,7 @@ suite() ->
 %%--------------------------------------------------------------------
 
 init_per_suite(Config) ->
-    application:start(p1_stringprep),
+    ok = stringprep:start(),
     meck_config(Config),
     mim_ct_rest:start(?BASIC_AUTH, Config),
     % Separate process needs to do this, because this one will terminate
@@ -71,7 +71,9 @@ init_per_suite(Config) ->
     Config.
 
 end_per_suite(Config) ->
-    exit(whereis(ejabberd_sup), kill),
+    ejabberd_auth_http:stop(?DOMAIN1),
+    ejabberd_auth_http:stop(?DOMAIN2),
+    ok = mim_ct_rest:stop(),
     Config.
 
 init_per_group(GroupName, Config) ->
@@ -125,9 +127,9 @@ set_password(_Config) ->
     ok = ejabberd_auth_http:set_password(<<"alice">>, ?DOMAIN1, <<"makota">>).
 
 try_register(_Config) ->
-    {atomic, ok} = ejabberd_auth_http:try_register(<<"nonexistent">>, ?DOMAIN1, <<"newpass">>),
+    ok = ejabberd_auth_http:try_register(<<"nonexistent">>, ?DOMAIN1, <<"newpass">>),
     true = ejabberd_auth_http:check_password(<<"nonexistent">>, ?DOMAIN1, <<"newpass">>),
-    {atomic, exists} = ejabberd_auth_http:try_register(<<"nonexistent">>, ?DOMAIN1, <<"anypass">>).
+    {error, exists} = ejabberd_auth_http:try_register(<<"nonexistent">>, ?DOMAIN1, <<"anypass">>).
 
 % get_password + get_password_s
 get_password(_Config) ->
@@ -142,24 +144,24 @@ get_password(_Config) ->
     end,
     false = ejabberd_auth_http:get_password(<<"anakin">>, ?DOMAIN1),
     <<>> = ejabberd_auth_http:get_password_s(<<"anakin">>, ?DOMAIN1).
-    
+
 is_user_exists(_Config) ->
-    true = ejabberd_auth_http:is_user_exists(<<"alice">>, ?DOMAIN1),
-    false = ejabberd_auth_http:is_user_exists(<<"madhatter">>, ?DOMAIN1).
+    true = ejabberd_auth_http:does_user_exist(<<"alice">>, ?DOMAIN1),
+    false = ejabberd_auth_http:does_user_exist(<<"madhatter">>, ?DOMAIN1).
 
 % remove_user/2,3
 remove_user(_Config) ->
-    true = ejabberd_auth_http:is_user_exists(<<"toremove1">>, ?DOMAIN1),
+    true = ejabberd_auth_http:does_user_exist(<<"toremove1">>, ?DOMAIN1),
     ok = ejabberd_auth_http:remove_user(<<"toremove1">>, ?DOMAIN1),
-    false = ejabberd_auth_http:is_user_exists(<<"toremove1">>, ?DOMAIN1),
+    false = ejabberd_auth_http:does_user_exist(<<"toremove1">>, ?DOMAIN1),
 
-    true = ejabberd_auth_http:is_user_exists(<<"toremove2">>, ?DOMAIN1),
-    not_allowed = ejabberd_auth_http:remove_user(<<"toremove2">>, ?DOMAIN1, <<"wrongpass">>),
-    true = ejabberd_auth_http:is_user_exists(<<"toremove2">>, ?DOMAIN1),
+    true = ejabberd_auth_http:does_user_exist(<<"toremove2">>, ?DOMAIN1),
+    {error, not_allowed} = ejabberd_auth_http:remove_user(<<"toremove2">>, ?DOMAIN1, <<"wrongpass">>),
+    true = ejabberd_auth_http:does_user_exist(<<"toremove2">>, ?DOMAIN1),
     ok = ejabberd_auth_http:remove_user(<<"toremove2">>, ?DOMAIN1, <<"pass">>),
-    false = ejabberd_auth_http:is_user_exists(<<"toremove2">>, ?DOMAIN1),
+    false = ejabberd_auth_http:does_user_exist(<<"toremove2">>, ?DOMAIN1),
 
-    not_exists = ejabberd_auth_http:remove_user(<<"toremove3">>, ?DOMAIN1, <<"wrongpass">>).
+    {error, not_exists} = ejabberd_auth_http:remove_user(<<"toremove3">>, ?DOMAIN1, <<"wrongpass">>).
 
 %%--------------------------------------------------------------------
 %% Helpers
@@ -191,3 +193,4 @@ do_scram(Pass, Config) ->
         _ ->
             Pass
     end.
+

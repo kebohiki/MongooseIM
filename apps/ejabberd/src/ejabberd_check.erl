@@ -52,36 +52,35 @@ check_database_modules() ->
 
 -spec check_database_module('mysql' | 'odbc' | 'pgsql') -> 'ok'.
 check_database_module(odbc) ->
-    check_modules(odbc, [odbc, odbc_app, odbc_sup, ejabberd_odbc, ejabberd_odbc_sup, odbc_queries]);
+    check_modules(odbc, [odbc, odbc_app, odbc_sup, mongoose_rdbms, mongoose_rdbms_sup,
+                         rdbms_queries]);
 check_database_module(mysql) ->
-    check_modules(mysql, [mysql, mysql_auth, mysql_conn, mysql_recv]);
+    check_modules(mysql, [mysql, mysql_cache, mysql_encode, mysql_protocol]);
 check_database_module(pgsql) ->
-    check_modules(pgsql, [pgsql, pgsql_proto, pgsql_tcp, pgsql_util]).
+    check_modules(pgsql, [epgsql, epgsql_binary, epgsql_errcodes, epgsql_fdatetime,
+                          epgsql_idatetime, epgsql_sock, epgsql_types, epgsql_wire, epgsqla,
+                          epgsqli]).
 
 
 %% @doc Issue a critical error and throw an exit if needing module is
 %% missing.
--spec check_modules(atom(), [atom()]) -> 'ok'.
+-spec check_modules(atom(), [module()]) -> 'ok'.
 check_modules(DB, Modules) ->
     case get_missing_modules(Modules) of
         [] ->
             ok;
-        MissingModules when is_list(MissingModules) ->
-            ?CRITICAL_MSG("ejabberd is configured to use '~p', but the following Erlang modules are not installed: '~p'", [DB, MissingModules]),
+        MissingModules ->
+            ?CRITICAL_MSG("MongooseIM is configured to use '~p', but the following Erlang modules "
+                          "are not installed: '~p'", [DB, MissingModules]),
             exit(database_module_missing)
     end.
 
 
 %% @doc Return the list of undefined modules
--spec get_missing_modules([atom()]) -> [atom()].
+-spec get_missing_modules([module()]) -> [module()].
 get_missing_modules(Modules) ->
-    lists:filter(fun(Module) ->
-                         case catch Module:module_info() of
-                             {'EXIT', {undef, _}} ->
-                                 true;
-                             _ -> false
-                         end
-                 end, Modules).
+    ModulesLoadResult = [{Module, code:ensure_loaded(Module)} || Module <- Modules],
+    [Module || {Module, {error, _}} <- ModulesLoadResult].
 
 
 %% @doc Return the list of databases used

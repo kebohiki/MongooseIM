@@ -26,27 +26,28 @@
 
 -module(mod_privacy).
 -author('alexey@process-one.net').
-
+-xep([{xep, 16}, {version, "1.6"}]).
+-xep([{xep, 126}, {version, "1.1"}]).
 -behaviour(gen_mod).
 
--export([start/2, stop/1,
-     process_iq/3,
-     process_iq_set/4,
-     process_iq_get/5,
-     get_user_list/3,
-     check_packet/6,
-     remove_user/2,
-     updated_list/3]).
+-export([start/2,
+         stop/1,
+         process_iq_set/4,
+         process_iq_get/5,
+         get_user_list/3,
+         check_packet/6,
+         remove_user/2,
+         remove_user/3,
+         updated_list/3]).
 
 -include("ejabberd.hrl").
 -include("jlib.hrl").
 -include("mod_privacy.hrl").
 
--define(BACKEND, (mod_privacy_backend:backend())).
+-define(BACKEND, mod_privacy_backend).
 
--export_type([userlist/0]).
+-export_type([list_item/0]).
 
--type userlist() :: #userlist{}.
 -type list_name() :: binary().
 -type list_item() :: #listitem{}.
 
@@ -57,7 +58,7 @@
     Host    :: binary(),
     Opts    :: list().
 
--callback remove_user(LUser, LServer) -> ok when
+-callback remove_user(LUser, LServer) -> any() when
     LUser   :: binary(),
     LServer :: binary().
 
@@ -114,9 +115,11 @@
 %% ------------------------------------------------------------------
 
 start(Host, Opts) ->
-    gen_mod:start_backend_module(?MODULE, Opts),
+    gen_mod:start_backend_module(?MODULE, Opts, [get_privacy_list, get_list_names,
+                                                 set_default_list, forget_default_list,
+                                                 remove_privacy_list, replace_privacy_list,
+                                                 get_default_list]),
     ?BACKEND:init(Host, Opts),
-    IQDisc = gen_mod:get_opt(iqdisc, Opts, one_queue),
     ejabberd_hooks:add(privacy_iq_get, Host,
                ?MODULE, process_iq_get, 50),
     ejabberd_hooks:add(privacy_iq_set, Host,
@@ -130,9 +133,7 @@ start(Host, Opts) ->
     ejabberd_hooks:add(remove_user, Host,
                ?MODULE, remove_user, 50),
     ejabberd_hooks:add(anonymous_purge_hook, Host,
-        ?MODULE, remove_user, 50),
-    gen_iq_handler:add_iq_handler(ejabberd_sm, Host, ?NS_PRIVACY,
-                  ?MODULE, process_iq, IQDisc).
+        ?MODULE, remove_user, 50).
 
 stop(Host) ->
     ejabberd_hooks:delete(privacy_iq_get, Host,
@@ -148,35 +149,33 @@ stop(Host) ->
     ejabberd_hooks:delete(remove_user, Host,
               ?MODULE, remove_user, 50),
     ejabberd_hooks:delete(anonymous_purge_hook, Host,
-        ?MODULE, remove_user, 50),
-    gen_iq_handler:remove_iq_handler(ejabberd_sm, Host, ?NS_PRIVACY).
+        ?MODULE, remove_user, 50).
 
 %% Handlers
 %% ------------------------------------------------------------------
 
-process_iq(_From, _To, IQ) ->
-    SubEl = IQ#iq.sub_el,
-    IQ#iq{type = error, sub_el = [SubEl, ?ERR_NOT_ALLOWED]}.
-
-process_iq_get(_,
-        _From = #jid{luser = LUser, lserver = LServer},
-        _To,
-        #iq{sub_el = #xmlel{children = Els}},
-        #userlist{name = Active}) ->
-    case xml:remove_cdata(Els) of
-        [] ->
-            process_lists_get(LUser, LServer, Active);
-        [#xmlel{name = Name, attrs = Attrs}] ->
-            case Name of
-                <<"list">> ->
-                    ListName = xml:get_attr(<<"name">>, Attrs),
-                    process_list_get(LUser, LServer, ListName);
-                _ ->
-                    {error, ?ERR_BAD_REQUEST}
-            end;
-        _ ->
-            {error, ?ERR_BAD_REQUEST}
-    end.
+process_iq_get(Acc,
+               _From = #jid{luser = LUser, lserver = LServer},
+               _To,
+               #iq{xmlns = ?NS_PRIVACY, sub_el = #xmlel{children = Els}},
+               #userlist{name = Active}) ->
+    Res = case xml:remove_cdata(Els) of
+              [] ->
+                  process_lists_get(LUser, LServer, Active);
+              [#xmlel{name = Name, attrs = Attrs}] ->
+                  case Name of
+                      <<"list">> ->
+                          ListName = xml:get_attr(<<"name">>, Attrs),
+                          process_list_get(LUser, LServer, ListName);
+                      _ ->
+                          {error, ?ERR_BAD_REQUEST}
+                  end;
+              _ ->
+                  {error, ?ERR_BAD_REQUEST}
+          end,
+    mongoose_acc:put(iq_result, Res, Acc);
+process_iq_get(Val, _, _, _, _) ->
+    Val.
 
 process_lists_get(LUser, LServer, Active) ->
     case ?BACKEND:get_list_names(LUser, LServer) of
@@ -201,26 +200,29 @@ process_list_get(LUser, LServer, {value, Name}) ->
 process_list_get(_LUser, _LServer, false) ->
     {error, ?ERR_BAD_REQUEST}.
 
-process_iq_set(_, From, _To, #iq{sub_el = SubEl}) ->
+process_iq_set(Acc, From, _To, #iq{xmlns = ?NS_PRIVACY, sub_el = SubEl}) ->
     #jid{luser = LUser, lserver = LServer} = From,
     #xmlel{children = Els} = SubEl,
-    case xml:remove_cdata(Els) of
-        [#xmlel{name = Name, attrs = Attrs, children = SubEls}] ->
-            ListName = xml:get_attr(<<"name">>, Attrs),
-            case Name of
-                <<"list">> ->
-                    process_list_set(LUser, LServer, ListName,
-                             xml:remove_cdata(SubEls));
-                <<"active">> ->
-                    process_active_set(LUser, LServer, ListName);
-                <<"default">> ->
-                    process_default_set(LUser, LServer, ListName);
-                _ ->
-                    {error, ?ERR_BAD_REQUEST}
-            end;
-        _ ->
-            {error, ?ERR_BAD_REQUEST}
-    end.
+    Res = case xml:remove_cdata(Els) of
+              [#xmlel{name = Name, attrs = Attrs, children = SubEls}] ->
+                  ListName = xml:get_attr(<<"name">>, Attrs),
+                  case Name of
+                      <<"list">> ->
+                          process_list_set(LUser, LServer, ListName,
+                                   xml:remove_cdata(SubEls));
+                      <<"active">> ->
+                          process_active_set(LUser, LServer, ListName);
+                      <<"default">> ->
+                          process_default_set(LUser, LServer, ListName);
+                      _ ->
+                          {error, ?ERR_BAD_REQUEST}
+                  end;
+              _ ->
+                  {error, ?ERR_BAD_REQUEST}
+          end,
+    mongoose_acc:put(iq_result, Res, Acc);
+process_iq_set(Val, _, _, _) ->
+    Val.
 
 process_default_set(LUser, LServer, {value, Name}) ->
     case ?BACKEND:set_default_list(LUser, LServer, Name) of
@@ -296,8 +298,8 @@ is_item_needdb(#listitem{type = group})        -> true;
 is_item_needdb(_)                              -> false.
 
 get_user_list(_, User, Server) ->
-    LUser = jlib:nodeprep(User),
-    LServer = jlib:nameprep(Server),
+    LUser = jid:nodeprep(User),
+    LServer = jid:nameprep(Server),
     case ?BACKEND:get_default_list(LUser, LServer) of
         {ok, {Default, List}} ->
             NeedDb = is_list_needdb(List),
@@ -309,33 +311,51 @@ get_user_list(_, User, Server) ->
 %% From is the sender, To is the destination.
 %% If Dir = out, User@Server is the sender account (From).
 %% If Dir = in, User@Server is the destination account (To).
-check_packet(_, User, Server,
+check_packet(Acc, User, Server,
          #userlist{list = List, needdb = NeedDb},
          {From, To, Packet},
          Dir) ->
-    case List of
+    CheckResult = case List of
         [] ->
             allow;
         _ ->
             PType = packet_directed_type(Dir, packet_type(Packet)),
             LJID = case Dir of
-                   in -> jlib:jid_tolower(From);
-                   out -> jlib:jid_tolower(To)
-               end,
+                   in -> jid:to_lower(From);
+                   out -> jid:to_lower(To)
+                   end,
             {Subscription, Groups} =
             case NeedDb of
                 true ->
-                    Host = jlib:nameprep(Server),
+                    Host = jid:nameprep(Server),
                     roster_get_jid_info(Host, User, Server, LJID);
                 false ->
                     {[], []}
             end,
-            check_packet_aux(List, PType, LJID, Subscription, Groups)
-    end.
+            Type = xml:get_attr_s(<<"type">>, Packet#xmlel.attrs),
+            check_packet_aux(List, PType, Type, LJID, Subscription, Groups)
+    end,
+    mongoose_acc:put(privacy_check, CheckResult, Acc).
 
-check_packet_aux([], _PType, _JID, _Subscription, _Groups) ->
+%% allow error messages
+check_packet_aux(_, message, <<"error">>, _JID, _Subscription, _Groups) ->
     allow;
-check_packet_aux([Item | List], PType, JID, Subscription, Groups) ->
+%% if we run of of list items then it is allowed
+check_packet_aux([], _PType, _MType, _JID, _Subscription, _Groups) ->
+    allow;
+%% check packet against next privacy list item
+check_packet_aux([Item | List], PType, MType, JID, Subscription, Groups) ->
+    #listitem{type = Type, value = Value, action = Action} = Item,
+    do_check_packet_aux(Type, Action, PType, Value, JID, MType, Subscription, Groups, Item, List).
+
+%% list set by blocking commands (XEP-0191) block all communication, both in and out,
+%% for a given JID
+do_check_packet_aux(jid, block, message, JID, JID, _, _, _, _, _) ->
+    block;
+do_check_packet_aux(jid, block, message_out, JID, JID, _, _, _, _, _) ->
+    block;
+%% then we do more complicated checking
+do_check_packet_aux(Type, Action, PType, Value, JID, MType, Subscription, Groups, Item, List) ->
     #listitem{type = Type, value = Value, action = Action} = Item,
     case is_ptype_match(Item, PType) of
         true ->
@@ -347,12 +367,11 @@ check_packet_aux([Item | List], PType, JID, Subscription, Groups) ->
                         true ->
                             Action;
                         false ->
-                            check_packet_aux(
-                                List, PType, JID, Subscription, Groups)
+                            check_packet_aux(List, PType, MType, JID, Subscription, Groups)
                     end
             end;
         false ->
-            check_packet_aux(List, PType, JID, Subscription, Groups)
+            check_packet_aux(List, PType, MType, JID, Subscription, Groups)
     end.
 
 is_ptype_match(Item, PType) ->
@@ -363,6 +382,9 @@ is_ptype_match(Item, PType) ->
             case PType of
                 message ->
                     Item#listitem.match_message;
+                message_out ->
+                    false; % according to xep-0016, privacy lists do not stop outgoing
+                           % messages (so they say)
                 iq ->
                     Item#listitem.match_iq;
                 presence_in ->
@@ -401,10 +423,16 @@ is_type_match(Type, Value, JID, Subscription, Groups) ->
             lists:member(Value, Groups)
     end.
 
+%% #rh
+remove_user(Acc, User, Server) ->
+    case remove_user(User, Server) of
+        ok -> Acc;
+        E -> E
+    end.
 
 remove_user(User, Server) ->
-    LUser = jlib:nodeprep(User),
-    LServer = jlib:nameprep(Server),
+    LUser = jid:nodeprep(User),
+    LServer = jid:nameprep(Server),
     ?BACKEND:remove_user(LUser, LServer).
 
 
@@ -422,8 +450,10 @@ updated_list(_,
 %% Deserialization
 %% ------------------------------------------------------------------
 
+
 packet_directed_type(Dir, Type) ->
     case {Type, Dir} of
+         {message, out} -> message_out;
          {message, in} -> message;
          {iq, in} -> iq;
          {presence, in} -> presence_in;
@@ -498,11 +528,11 @@ set_type_and_value(<<>>, _Value, Item) ->
 set_type_and_value(_Type, <<>>, _Item) ->
     false;
 set_type_and_value(<<"jid">>, Value, Item) ->
-    case jlib:binary_to_jid(Value) of
+    case jid:from_binary(Value) of
         error ->
             false;
         JID ->
-            Item#listitem{type = jid, value = jlib:jid_tolower(JID)}
+            Item#listitem{type = jid, value = jid:to_lower(JID)}
     end;
 set_type_and_value(<<"group">>, Value, Item) ->
     Item#listitem{type = group, value = Value};
@@ -597,7 +627,7 @@ item_to_xml_attrs(Item=#listitem{type=Type, value=Value}) ->
 item_to_xml_attrs1(#listitem{action=Action, order=Order}) ->
     [{<<"action">>, action_to_binary(Action)},
      {<<"order">>, order_to_binary(Order)}].
-    
+
 item_to_xml_children(#listitem{match_all=true}) ->
     [];
 item_to_xml_children(#listitem{match_all=false,
@@ -631,7 +661,7 @@ type_to_binary(Type) ->
 
 value_to_binary(Type, Val) ->
     case Type of
-    jid -> jlib:jid_to_binary(Val);
+    jid -> jid:to_binary(Val);
     group -> Val;
     subscription ->
         case Val of
@@ -667,14 +697,12 @@ binary_to_order_s(Order) ->
 %% ------------------------------------------------------------------
 
 broadcast_privacy_list(LUser, LServer, Name, UserList) ->
-    UserJID = jlib:make_jid(LUser, LServer, <<>>),
-    ejabberd_router:route(UserJID, UserJID, broadcast_privacy_list_packet(Name, UserList)).
+    UserJID = jid:make(LUser, LServer, <<>>),
+    ejabberd_sm:route(UserJID, UserJID, broadcast_privacy_list_packet(Name, UserList)).
 
 %% TODO this is dirty
 broadcast_privacy_list_packet(Name, UserList) ->
-    #xmlel{
-        name = <<"broadcast">>,
-        children = [{privacy_list, UserList, Name}]}.
+    {broadcast, {privacy_list, UserList, Name}}.
 
 roster_get_jid_info(Host, User, Server, LJID) ->
     ejabberd_hooks:run_fold(

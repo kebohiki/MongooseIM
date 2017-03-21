@@ -6,7 +6,8 @@
 -module(mod_bosh).
 -behaviour(gen_mod).
 -behaviour(cowboy_loop_handler).
-
+-xep([{xep, 206}, {version, "1.4"}]).
+-xep([{xep, 124}, {version, "1.11"}]).
 %% API
 -export([get_inactivity/0,
          set_inactivity/1,
@@ -19,22 +20,22 @@
 -export([start/2,
          stop/1]).
 
-%% ejabberd independent listener callbacks
--export([socket_type/0,
-         start_listener/2]).
-
 %% cowboy_loop_handler callbacks
 -export([init/3,
          info/3,
          terminate/3]).
+
+%% Hooks callbacks
+-export([node_cleanup/2]).
+
+%% For testing and debugging
+-export([get_session_socket/1, store_session/2]).
 
 -include("ejabberd.hrl").
 -include("jlib.hrl").
 -include_lib("exml/include/exml_stream.hrl").
 -include("mod_bosh.hrl").
 
--define(LISTENER, ?MODULE).
--define(DEFAULT_BACKEND, mnesia).
 -define(DEFAULT_MAX_AGE, 1728000).  %% 20 days in seconds
 -define(DEFAULT_INACTIVITY, 30).  %% seconds
 -define(DEFAULT_MAX_WAIT, infinity).  %% seconds
@@ -48,7 +49,10 @@
              ]).
 
 -type socket() :: #bosh_socket{}.
--type session() :: #bosh_session{}.
+-type session() :: #bosh_session{
+                      sid :: mod_bosh:sid(),
+                      socket :: pid()
+                     }.
 -type sid() :: binary().
 -type event_type() :: streamstart
                     | restart
@@ -62,12 +66,22 @@
 -type req() :: cowboy_req:req().
 
 -type info() :: 'accept_options'
+              | 'accept_get'
               | 'item_not_found'
               | 'no_body'
               | 'policy_violation'
               | {'bosh_reply', jlib:xmlel()}
-              | {'close',_}
-              | {'wrong_method',_}.
+              | {'close', _}
+              | {'wrong_method', _}.
+
+%% Behaviour callbacks
+
+-callback start(list()) -> any().
+-callback create_session(mod_bosh:session()) -> any().
+-callback delete_session(mod_bosh:sid()) -> any().
+-callback get_session(mod_bosh:sid()) -> [mod_bosh:session()].
+-callback get_sessions() -> [mod_bosh:session()].
+-callback node_cleanup(Node :: atom()) -> any().
 
 %%--------------------------------------------------------------------
 %% API
@@ -112,53 +126,33 @@ set_server_acks(EnableServerAcks) ->
 %% gen_mod callbacks
 %%--------------------------------------------------------------------
 
--spec start(ejabberd:host(), [option()]) -> any().
+-spec start(ejabberd:server(), [option()]) -> any().
 start(_Host, Opts) ->
     try
-        case gen_mod:get_opt(port, Opts, undefined) of
-            undefined ->
-                ok;
-            Port ->
-                ok = start_cowboy(Port, Opts)
-        end,
-        ok = start_backend(Opts),
-        {ok, _Pid} = mod_bosh_socket:start_supervisor()
+        start_backend(Opts),
+        {ok, _Pid} = mod_bosh_socket:start_supervisor(),
+        ejabberd_hooks:add(node_cleanup, global, ?MODULE, node_cleanup, 50)
     catch
         error:{badmatch, ErrorReason} ->
             ErrorReason
     end.
 
 stop(_Host) ->
-    %% TODO: stop backend and supervisor
-    cowboy:stop_listener(?LISTENER).
-
+    ok.
 %%--------------------------------------------------------------------
-%% ejabberd independent listener callbacks
+%% Hooks handlers
 %%--------------------------------------------------------------------
 
-socket_type() ->
-    independent.
-
-%% @doc Start the module. Called from `ejabberd_listener'.
-%% If the option `ip' is undefined, then `InetAddr' is `{0,0,0,0}'.
--spec start_listener({Port :: inet:port_number(),
-                      InetAddr :: inet:ip_address(),
-                      tcp}, Opts :: proplists:proplist()) -> any().
-start_listener({Port, InetAddr, tcp}, Opts) ->
-    OptsWPort = lists:keystore(port, 1, [{ip,InetAddr}|Opts], {port, Port}),
-    gen_mod:start_module(?MYNAME, ?MODULE, OptsWPort).
+node_cleanup(Acc, Node) ->
+    Res = mod_bosh_backend:node_cleanup(Node),
+    maps:put(cleanup_result, Res, Acc).
 
 %%--------------------------------------------------------------------
 %% cowboy_loop_handler callbacks
 %%--------------------------------------------------------------------
 
 -type option() :: {atom(), any()}.
--spec init(_Transport, req(), _Opts :: [option()])
-            -> {'loop', req(), rstate()}
-             | {no_body, req()}
-             | {{wrong_method, _}, req()}
-             | {forward_body, req()}
-             | {accept_options, req()}.
+-spec init(_Transport, req(), _Opts :: [option()]) -> {loop, req(), rstate()}.
 init(_Transport, Req, _Opts) ->
     ?DEBUG("New request~n", []),
     {Msg, NewReq} = try
@@ -169,6 +163,8 @@ init(_Transport, Req, _Opts) ->
             <<"POST">> ->
                 {has_body, true} = {has_body, cowboy_req:has_body(Req2)},
                 {forward_body, Req2};
+            <<"GET">> ->
+                {accept_get, Req2};
             _ ->
                 error({badmatch, {Method, Req2}})
         end
@@ -184,12 +180,20 @@ init(_Transport, Req, _Opts) ->
     {loop, NewReq, #rstate{}}.
 
 
--spec info(info(), req(), rstate()) -> {'ok',req(),_}.
+-spec info(info(), req(), rstate()) -> {'ok', req(), _}.
 info(accept_options, Req, State) ->
     {Origin, Req2} = cowboy_req:header(<<"origin">>, Req),
     Headers = ac_all(Origin),
     ?DEBUG("OPTIONS response: ~p~n", [Headers]),
     {ok, strip_ok(cowboy_req:reply(200, Headers, <<>>, Req2)), State};
+info(accept_get, Req, State) ->
+    Headers = [content_type(),
+               ac_allow_methods(),
+               ac_allow_headers(),
+               ac_max_age()],
+    {ok,
+     strip_ok(cowboy_req:reply(200, Headers, <<"MongooseIM bosh endpoint">>, Req)),
+     State};
 info(no_body, Req, State) ->
     ?DEBUG("Missing request body: ~p~n", [Req]),
     {ok, no_body_error(Req), State};
@@ -229,32 +233,10 @@ terminate(_Reason, _Req, _State) ->
 %% Callbacks implementation
 %%--------------------------------------------------------------------
 
--spec start_cowboy(inet:port_number(), [option()]) -> 'ok' | {'error','badarg'}.
-start_cowboy(Port, Opts) ->
-    Host = proplists:get_value(host, Opts, '_'),
-    Prefix = proplists:get_value(prefix, Opts, "/http-bind"),
-    NumAcceptors = proplists:get_value(num_acceptors, Opts, 100),
-    Dispatch = cowboy_router:compile([{Host, [{Prefix, ?MODULE, Opts}] }]),
-    TransOpts = [{port, Port}|get_option_pair(ip, Opts)],
-    ProtoOpts = [{env, [{dispatch, Dispatch}]}],
-    case cowboy:start_http(?LISTENER, NumAcceptors, TransOpts, ProtoOpts) of
-        {error, {already_started, _Pid}} ->
-            ok;
-        {ok, _Pid} ->
-            ok;
-        {error, Reason} ->
-            {error, Reason}
-    end.
-
-
--spec start_backend([option()]) -> 'ok'.
+-spec start_backend([option()]) -> any().
 start_backend(Opts) ->
-    Backend = proplists:get_value(backend, Opts, ?DEFAULT_BACKEND),
-    {Mod, Code} = dynamic_compile:from_string(mod_bosh_dynamic_src(Backend)),
-    code:load_binary(Mod, "mod_bosh_dynamic.erl", Code),
-    ?BOSH_BACKEND:start(Opts),
-    ok.
-
+    gen_mod:start_backend_module(mod_bosh, Opts, []),
+    mod_bosh_backend:start(Opts).
 
 -spec event_type(jlib:xmlel()) -> event_type().
 event_type(Body) ->
@@ -290,7 +272,7 @@ event_type(Body) ->
 
 
 -spec forward_body(req(), jlib:xmlel(), rstate())
-            -> {'loop',_,rstate()} | {'ok',req(),rstate()}.
+            -> {'loop', _, rstate()} | {'ok', req(), rstate()}.
 forward_body(Req, #xmlel{} = Body, S) ->
     try
         case Type = event_type(Body) of
@@ -320,7 +302,7 @@ handle_request(Socket, {EventType, Body}) ->
 
 -spec get_session_socket(mod_bosh:sid()) -> 'undefined' | pid().
 get_session_socket(Sid) ->
-    case ?BOSH_BACKEND:get_session(Sid) of
+    case mod_bosh_backend:get_session(Sid) of
         [BS] ->
             BS#bosh_session.socket;
         [] ->
@@ -328,19 +310,18 @@ get_session_socket(Sid) ->
     end.
 
 
--spec maybe_start_session(req(), binary()) -> {boolean(), req()}.
+-spec maybe_start_session(req(), jlib:xmlel()) -> {boolean(), req()}.
 maybe_start_session(Req, Body) ->
     try
-        {<<"hold">>, <<"1">>} = {<<"hold">>,
-                                 exml_query:attr(Body, <<"hold">>)},
         Hosts = ejabberd_config:get_global_option(hosts),
         {<<"to">>, true} = {<<"to">>,
                             lists:member(exml_query:attr(Body, <<"to">>),
                                          Hosts)},
         %% Version isn't checked as it would be meaningless when supporting
         %% only a subset of the specification.
+        {ok, NewBody} = set_max_hold(Body),
         {Peer, Req1} = cowboy_req:peer(Req),
-        start_session(Peer, Body),
+        start_session(Peer, NewBody),
         {true, Req1}
     catch
         error:{badmatch, {<<"to">>, _}} ->
@@ -355,11 +336,13 @@ maybe_start_session(Req, Body) ->
 start_session(Peer, Body) ->
     Sid = make_sid(),
     {ok, Socket} = mod_bosh_socket:start(Sid, Peer),
-    BoshSession = #bosh_session{sid = Sid, socket = Socket},
-    ?BOSH_BACKEND:create_session(BoshSession),
+    store_session(Sid, Socket),
     handle_request(Socket, {streamstart, Body}),
     ?DEBUG("Created new session ~p~n", [Sid]).
 
+-spec store_session(Sid :: sid(), Socket :: pid()) -> any().
+store_session(Sid, Socket) ->
+    mod_bosh_backend:create_session(#bosh_session{sid = Sid, socket = Socket}).
 
 -spec make_sid() -> binary().
 make_sid() ->
@@ -381,7 +364,7 @@ method_not_allowed_error(Req) ->
     strip_ok(cowboy_req:reply(405, ac_all(?DEFAULT_ALLOW_ORIGIN),
                               <<"Use POST request method">>, Req)).
 
--spec strip_ok({'ok',cowboy_req:req()}) -> cowboy_req:req().
+-spec strip_ok({'ok', cowboy_req:req()}) -> cowboy_req:req().
 strip_ok({ok, Req}) ->
     Req.
 
@@ -411,20 +394,6 @@ terminal_condition_body(Condition, Children) ->
                           children = Children}).
 
 %%--------------------------------------------------------------------
-%% Backend configuration
-%%--------------------------------------------------------------------
-
--spec mod_bosh_dynamic_src(atom()) -> string().
-mod_bosh_dynamic_src(Backend) ->
-    lists:flatten(
-      ["-module(mod_bosh_dynamic).
-        -export([backend/0]).
-
-        -spec backend() -> atom().
-        backend() ->
-            mod_bosh_", atom_to_list(Backend), ".\n"]).
-
-%%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
 
@@ -435,7 +404,7 @@ ac_allow_origin(Origin) ->
     {<<"Access-Control-Allow-Origin">>, Origin}.
 
 ac_allow_methods() ->
-    {<<"Access-Control-Allow-Methods">>, <<"POST, OPTIONS">>}.
+    {<<"Access-Control-Allow-Methods">>, <<"POST, OPTIONS, GET">>}.
 
 ac_allow_headers() ->
     {<<"Access-Control-Allow-Headers">>, <<"Content-Type">>}.
@@ -444,17 +413,24 @@ ac_max_age() ->
     {<<"Access-Control-Max-Age">>, integer_to_binary(?DEFAULT_MAX_AGE)}.
 
 
--spec ac_all('undefined' | binary()) -> [{binary(),_},...].
+-spec ac_all('undefined' | binary()) -> [{binary(), _}, ...].
 ac_all(Origin) ->
     [ac_allow_origin(Origin),
      ac_allow_methods(),
      ac_allow_headers(),
      ac_max_age()].
 
+set_max_hold(Body) ->
+    HoldBin = exml_query:attr(Body, <<"hold">>),
+    ClientHold = binary_to_integer(HoldBin),
+    maybe_set_max_hold(ClientHold, Body).
 
--spec get_option_pair('ip',[any()]) -> [{'ip',_}].
-get_option_pair(Key, Opts) ->
-    case proplists:get_value(Key, Opts) of
-        undefined -> [];
-        Value     -> [{Key, Value}]
-    end.
+
+maybe_set_max_hold(1, Body) ->
+    {ok, Body};
+maybe_set_max_hold(ClientHold, #xmlel{attrs = Attrs} = Body) when ClientHold > 1 ->
+    NewAttrs = lists:keyreplace(<<"hold">>, 1, Attrs, {<<"hold">>, <<"1">>}),
+    {ok, Body#xmlel{attrs = NewAttrs}};
+maybe_set_max_hold(_, _) ->
+    {error, invalid_hold}.
+

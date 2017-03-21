@@ -26,7 +26,6 @@
 
 -module(ejabberd_s2s_in).
 -author('alexey@process-one.net').
-
 -behaviour(gen_fsm).
 
 %% External exports
@@ -63,10 +62,10 @@
                 tls_enabled = false   :: boolean(),
                 tls_required = false  :: boolean(),
                 tls_certverify = false :: boolean(),
-                tls_options = []      :: [{_,_}],
-                server                :: ejabberd:server(),
+                tls_options = []      :: [{_, _}],
+                server                :: ejabberd:server() | undefined,
                 authenticated = false :: boolean(),
-                auth_domain           :: binary(),
+                auth_domain           :: binary() | undefined,
                 connections = ?DICT:new(),
                 timer                 :: reference()
               }).
@@ -106,28 +105,28 @@
 -define(STREAM_TRAILER, <<"</stream:stream>">>).
 
 -define(INVALID_NAMESPACE_ERR,
-        xml:element_to_binary(?SERR_INVALID_NAMESPACE)).
+        exml:to_binary(?SERR_INVALID_NAMESPACE)).
 
 -define(HOST_UNKNOWN_ERR,
-        xml:element_to_binary(?SERR_HOST_UNKNOWN)).
+        exml:to_binary(?SERR_HOST_UNKNOWN)).
 
 -define(INVALID_FROM_ERR,
-        xml:element_to_binary(?SERR_INVALID_FROM)).
+        exml:to_binary(?SERR_INVALID_FROM)).
 
 -define(INVALID_XML_ERR,
-        xml:element_to_binary(?SERR_XML_NOT_WELL_FORMED)).
+        exml:to_binary(?SERR_XML_NOT_WELL_FORMED)).
 
 %%%----------------------------------------------------------------------
 %%% API
 %%%----------------------------------------------------------------------
--spec start(_,_) -> {'error',_}
-                  | {'ok','undefined' | pid()}
-                  | {'ok','undefined' | pid(),_}.
+-spec start(_, _) -> {'error', _}
+                  | {'ok', 'undefined' | pid()}
+                  | {'ok', 'undefined' | pid(), _}.
 start(SockData, Opts) ->
     ?SUPERVISOR_START.
 
 
--spec start_link(_,_) -> 'ignore' | {'error',_} | {'ok',pid()}.
+-spec start_link(_, _) -> 'ignore' | {'error', _} | {'ok', pid()}.
 start_link(SockData, Opts) ->
     gen_fsm:start_link(ejabberd_s2s_in, [SockData, Opts], ?FSMOPTS).
 
@@ -146,7 +145,7 @@ socket_type() ->
 %%          ignore                              |
 %%          {stop, StopReason}
 %%----------------------------------------------------------------------
--spec init(_) -> {'ok','wait_for_stream',state()}.
+-spec init(_) -> {'ok', 'wait_for_stream', state()}.
 init([{SockMod, Socket}, Opts]) ->
     ?DEBUG("started: ~p", [{SockMod, Socket}]),
     Shaper = case lists:keysearch(shaper, 1, Opts) of
@@ -163,12 +162,18 @@ init([{SockMod, Socket}, Opts]) ->
              required_trusted ->
                  {true, true, true}
          end,
-    TLSOpts = case ejabberd_config:get_local_option(s2s_certfile) of
+    TLSOpts1 = case ejabberd_config:get_local_option(s2s_certfile) of
                   undefined ->
                       [];
                   CertFile ->
                       [{certfile, CertFile}]
               end,
+    TLSOpts2 = lists:filter(fun({protocol_options, _}) -> true;
+                               ({dhfile, _}) -> true;
+                               ({ciphers, _}) -> true;
+                               (_) -> false
+                            end, Opts),
+    TLSOpts = lists:append(TLSOpts1, TLSOpts2),
     Timer = erlang:start_timer(?S2STIMEOUT, self(), []),
     {ok, wait_for_stream,
      #state{socket = Socket,
@@ -235,11 +240,15 @@ wait_for_stream({xmlstreamstart, _Name, Attrs}, StateData) ->
                        end,
             case SASL of
                 {error_cert_verif, CertVerifyResult, Certificate} ->
-                    CertError = ejabberd_tls:get_cert_verify_string(CertVerifyResult, Certificate),
+                    CertError = fast_tls:get_cert_verify_string(CertVerifyResult, Certificate),
                     RemoteServer = xml:get_attr_s(<<"from">>, Attrs),
-                    ?INFO_MSG("Closing s2s connection: ~s <--> ~s (~s)", [StateData#state.server, RemoteServer, CertError]),
-                    send_text(StateData, xml:element_to_string(?SERRT_POLICY_VIOLATION(<<"en">>, CertError))),
-                    {atomic, Pid} = ejabberd_s2s:find_connection(jlib:make_jid(<<"">>, Server, <<"">>), jlib:make_jid(<<"">>, RemoteServer, <<"">>)),
+                    ?INFO_MSG("Closing s2s connection: ~s <--> ~s (~s)",
+                      [StateData#state.server, RemoteServer, CertError]),
+                    send_text(StateData, exml:to_binary(
+                                ?SERRT_POLICY_VIOLATION(<<"en">>, CertError))),
+                    {atomic, Pid} = ejabberd_s2s:find_connection(
+                                      jid:make(<<"">>, Server, <<"">>),
+                                      jid:make(<<"">>, RemoteServer, <<"">>)),
                     ejabberd_s2s_out:stop_connection(Pid),
 
                     {stop, normal, StateData};
@@ -306,9 +315,9 @@ wait_for_feature_request({xmlstreamelement, El}, StateData) ->
                       end,
             TLSSocket = (StateData#state.sockmod):starttls(
                           Socket, TLSOpts,
-                          xml:element_to_binary(
-                             #xmlel{name = <<"proceed">>,
-                                    attrs = [{<<"xmlns">>, ?NS_TLS}]})),
+                          exml:to_binary(
+                            #xmlel{name = <<"proceed">>,
+                                   attrs = [{<<"xmlns">>, ?NS_TLS}]})),
             {next_state, wait_for_stream,
              StateData#state{socket = TLSSocket,
                              streamid = new_id(),
@@ -320,7 +329,7 @@ wait_for_feature_request({xmlstreamelement, El}, StateData) ->
             case Mech of
                 <<"EXTERNAL">> ->
                     Auth = jlib:decode_base64(xml:get_cdata(Els)),
-                    AuthDomain = jlib:nameprep(Auth),
+                    AuthDomain = jid:nameprep(Auth),
                     AuthRes =
                         case (StateData#state.sockmod):get_peer_certificate(
                                StateData#state.socket) of
@@ -351,8 +360,6 @@ wait_for_feature_request({xmlstreamelement, El}, StateData) ->
                         end,
                     if
                         AuthRes ->
-                            (StateData#state.sockmod):reset_stream(
-                              StateData#state.socket),
                             send_element(StateData,
                                           #xmlel{name = <<"success">>,
                                                  attrs = [{<<"xmlns">>, ?NS_SASL}]}),
@@ -397,8 +404,8 @@ stream_established({xmlstreamelement, El}, StateData) ->
     case is_key_packet(El) of
         {key, To, From, Id, Key} ->
             ?DEBUG("GET KEY: ~p", [{To, From, Id, Key}]),
-            LTo = jlib:nameprep(To),
-            LFrom = jlib:nameprep(From),
+            LTo = jid:nameprep(To),
+            LFrom = jid:nameprep(From),
             %% Checks if the from domain is allowed and if the to
             %% domain is handled by this server:
             case {ejabberd_s2s:allow_host(LTo, LFrom),
@@ -410,7 +417,7 @@ stream_established({xmlstreamelement, El}, StateData) ->
                                             Key, StateData#state.streamid}),
                     Conns = ?DICT:store({LFrom, LTo}, wait_for_verification,
                                         StateData#state.connections),
-                    change_shaper(StateData, LTo, jlib:make_jid(<<"">>, LFrom, <<"">>)),
+                    change_shaper(StateData, LTo, jid:make(<<"">>, LFrom, <<"">>)),
                     {next_state,
                      stream_established,
                      StateData#state{connections = Conns,
@@ -424,15 +431,12 @@ stream_established({xmlstreamelement, El}, StateData) ->
             end;
         {verify, To, From, Id, Key} ->
             ?DEBUG("VERIFY KEY: ~p", [{To, From, Id, Key}]),
-            LTo = jlib:nameprep(To),
-            LFrom = jlib:nameprep(From),
-            Type = case ejabberd_s2s:has_key({LTo, LFrom}, Key) of
-                       true -> <<"valid">>;
+            LTo = jid:nameprep(To),
+            LFrom = jid:nameprep(From),
+            Type = case ejabberd_s2s:key({LTo, LFrom}, Id) of
+                       Key -> <<"valid">>;
                        _ -> <<"invalid">>
                    end,
-            %Type = if Key == Key1 -> "valid";
-            % true -> "invalid"
-            % end,
             send_element(StateData,
                          #xmlel{name = <<"db:verify">>,
                                 attrs = [{<<"from">>, To},
@@ -444,9 +448,9 @@ stream_established({xmlstreamelement, El}, StateData) ->
             NewEl = jlib:remove_attr(<<"xmlns">>, El),
             #xmlel{name = Name, attrs = Attrs} = NewEl,
             From_s = xml:get_attr_s(<<"from">>, Attrs),
-            From = jlib:binary_to_jid(From_s),
+            From = jid:from_binary(From_s),
             To_s = xml:get_attr_s(<<"to">>, Attrs),
-            To = jlib:binary_to_jid(To_s),
+            To = jid:from_binary(To_s),
             if
                 (To /= error) and (From /= error) ->
                     LFrom = From#jid.lserver,
@@ -506,8 +510,8 @@ stream_established({valid, From, To}, StateData) ->
                         attrs = [{<<"from">>, To},
                                  {<<"to">>, From},
                                  {<<"type">>, <<"valid">>}]}),
-    LFrom = jlib:nameprep(From),
-    LTo = jlib:nameprep(To),
+    LFrom = jid:nameprep(From),
+    LTo = jid:nameprep(To),
     NSD = StateData#state{
             connections = ?DICT:store({LFrom, LTo}, established,
                                       StateData#state.connections)},
@@ -518,8 +522,8 @@ stream_established({invalid, From, To}, StateData) ->
                         attrs = [{<<"from">>, To},
                                  {<<"to">>, From},
                                  {<<"type">>, <<"invalid">>}]}),
-    LFrom = jlib:nameprep(From),
-    LTo = jlib:nameprep(To),
+    LFrom = jid:nameprep(From),
+    LTo = jid:nameprep(To),
     NSD = StateData#state{
             connections = ?DICT:erase({LFrom, LTo},
                                       StateData#state.connections)},
@@ -565,14 +569,14 @@ handle_event(_Event, StateName, StateData) ->
 %%   Reply = {state_infos, [{InfoName::atom(), InfoValue::any()]
 %%----------------------------------------------------------------------
 -spec handle_sync_event(any(), any(), statename(), state()
-                       ) -> {'reply','ok' | {'state_infos',[any(),...]},_,_}.
+                       ) -> {'reply', 'ok' | {'state_infos', [any(), ...]}, atom(), state()}.
 handle_sync_event(get_state_infos, _From, StateName, StateData) ->
     SockMod = StateData#state.sockmod,
-    {Addr,Port} = try SockMod:peername(StateData#state.socket) of
-                      {ok, {A,P}} ->  {A,P};
-                      {error, _} -> {unknown,unknown}
+    {Addr, Port} = try SockMod:peername(StateData#state.socket) of
+                      {ok, {A, P}} ->  {A, P};
+                      {error, _} -> {unknown, unknown}
                   catch
-                      _:_ -> {unknown,unknown}
+                      _:_ -> {unknown, unknown}
                   end,
     Domains =   case StateData#state.authenticated of
                     true ->
@@ -597,7 +601,7 @@ handle_sync_event(get_state_infos, _From, StateName, StateData) ->
              {domains, Domains}
             ],
     Reply = {state_infos, Infos},
-    {reply,Reply,StateName,StateData};
+    {reply, Reply, StateName, StateData};
 
 %%----------------------------------------------------------------------
 %% Func: handle_sync_event/4
@@ -622,7 +626,7 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 %%          {next_state, NextStateName, NextStateData, Timeout} |
 %%          {stop, Reason, NewStateData}
 %%----------------------------------------------------------------------
--spec handle_info(_,_,_) -> fsm_return().
+-spec handle_info(_, _, _) -> {next_state, atom(), state()} | {stop, normal, state()}.
 handle_info({send_text, Text}, StateName, StateData) ->
     send_text(StateData, Text),
     {next_state, StateName, StateData};
@@ -655,7 +659,7 @@ send_text(StateData, Text) ->
 
 -spec send_element(state(), jlib:xmlel()) -> binary().
 send_element(StateData, El) ->
-    send_text(StateData, xml:element_to_binary(El)).
+    send_text(StateData, exml:to_binary(El)).
 
 
 -spec change_shaper(state(), Host :: 'global' | binary(), ejabberd:jid()) -> any().
@@ -680,8 +684,8 @@ cancel_timer(Timer) ->
     end.
 
 
--spec is_key_packet(jlib:xmlel()) -> 'false' | {'key',_,_,_,binary()}
-                                  | {'verify',_,_,_,binary()}.
+-spec is_key_packet(jlib:xmlel()) -> 'false' | {'key', _, _, _, binary()}
+                                  | {'verify', _, _, _, binary()}.
 is_key_packet(#xmlel{name = Name, attrs = Attrs,
                      children = Els}) when Name == <<"db:result">> ->
     {key,
@@ -700,7 +704,7 @@ is_key_packet(_) ->
     false.
 
 
--spec get_cert_domains(#'Certificate'{}) -> [any()].
+-spec get_cert_domains(#'Certificate'{}) ->  [any()].
 get_cert_domains(Cert) ->
     {rdnSequence, Subject} =
         (Cert#'Certificate'.tbsCertificate)#'TBSCertificate'.subject,
@@ -718,7 +722,7 @@ get_cert_domains(Cert) ->
                           end,
                       if
                           D /= error ->
-                              case jlib:binary_to_jid(D) of
+                              case jid:from_binary(D) of
                                   #jid{luser = <<"">>,
                                        lserver = LD,
                                        lresource = <<"">>} ->
@@ -753,7 +757,7 @@ get_cert_domains(Cert) ->
                                     case 'XmppAddr':decode(
                                            'XmppAddr', XmppAddr) of
                                         {ok, D} when is_binary(D) ->
-                                            case jlib:binary_to_jid(D) of
+                                            case jid:from_binary(D) of
                                                 #jid{luser = <<"">>,
                                                      lserver = LD,
                                                      lresource = <<"">>} ->
@@ -770,7 +774,7 @@ get_cert_domains(Cert) ->
                                             []
                                     end;
                                ({dNSName, D}) when is_list(D) ->
-                                    case jlib:binary_to_jid(list_to_binary(D)) of
+                                    case jid:from_binary(list_to_binary(D)) of
                                         #jid{luser = <<"">>,
                                              lserver = LD,
                                              lresource = <<"">>} ->
@@ -798,7 +802,7 @@ match_domain(Domain, Pattern) ->
     match_labels(DLabels, PLabels).
 
 
--spec match_labels([binary()],[binary()]) -> boolean().
+-spec match_labels([binary()], [binary()]) -> boolean().
 match_labels([], []) ->
     true;
 match_labels([], [_ | _]) ->

@@ -32,15 +32,21 @@
 %%% -------------------------------------
 
 start(BasicAuth, Config) ->
-    ensure_started(crypto),
-    ensure_started(public_key),
-    ensure_started(ssl),
-    ensure_started(lhttpc),
+    application:ensure_all_started(ssl),
+    application:ensure_all_started(lhttpc),
     {ok, _} = gen_server:start({local, mim_ct_rest_server}, ?MODULE, [BasicAuth], []),
     Config.
 
 stop() ->
-    gen_server:call(mim_ct_rest_server, stop).
+    Pid = whereis(mim_ct_rest_server),
+    Ref = erlang:monitor(process, Pid),
+    gen_server:call(Pid, stop),
+    receive
+        {'DOWN', Ref, process, Pid, _} ->
+            ok
+    after timer:seconds(5) ->
+            error(timeout)
+    end.
 
 listen() ->
     gen_server:call(mim_ct_rest_server, listen).
@@ -99,9 +105,7 @@ do(Fun) ->
 %%% -------------------------------------
 
 init([BasicAuth]) ->
-    ensure_started(cowlib),
-    ensure_started(ranch),
-    ensure_started(cowboy),
+    application:ensure_all_started(cowboy),
     DispatchEJD = cowboy_router:compile([
             {'_', [{"/auth/:method/", mim_ct_rest_handler, []}]}
         ]),
@@ -176,12 +180,3 @@ code_change(_, State, _) ->
 terminate(_Reason, _State) ->
     cowboy:stop_listener(tests_listener).
 
-%%% -------------------------------------
-%%% internal functions
-%%% -------------------------------------
-
-ensure_started(App) ->
-    case lists:keyfind(App, 1, application:which_applications()) of
-        false -> application:start(App);
-        _ -> ok
-    end.

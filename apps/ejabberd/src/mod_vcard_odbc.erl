@@ -29,7 +29,13 @@
 -behaviour(mod_vcard).
 
 %% mod_vcards callbacks
--export([init/2,remove_user/2, get_vcard/2, set_vcard/4, search/4, search_fields/1]).
+-export([init/2,
+         remove_user/2,
+         get_vcard/2,
+         set_vcard/4,
+         search/2,
+         search_fields/1,
+         search_reported_fields/2]).
 
 -include("ejabberd.hrl").
 -include("jlib.hrl").
@@ -43,60 +49,59 @@ init(_VHost, _Options) ->
     ok.
 
 remove_user(LUser, LServer) ->
-    Username = ejabberd_odbc:escape(LUser),
-    ejabberd_odbc:sql_transaction(
+    Username = mongoose_rdbms:escape(LUser),
+    mongoose_rdbms:sql_transaction(
       LServer,
       [["delete from vcard where username='", Username, "';"],
        ["delete from vcard_search where lusername='", Username, "';"]]).
 
 get_vcard(LUser, LServer) ->
-    U = ejabberd_odbc:escape(LUser),
-    S = ejabberd_odbc:escape(LServer),
-    case odbc_queries:get_vcard(S,U) of
-        {selected, [<<"vcard">>], [{SVCARD}]} ->
-            case xml_stream:parse_element(SVCARD) of
+    U = mongoose_rdbms:escape(LUser),
+    S = mongoose_rdbms:escape(LServer),
+    case rdbms_queries:get_vcard(S, U) of
+        {selected, [{SVCARD}]} ->
+            case exml:parse(SVCARD) of
                 {error, Reason} ->
-                    ?WARNING_MSG("not sending bad vcard xml ~p~n~p",[Reason,SVCARD]),
+                    ?WARNING_MSG("not sending bad vcard xml ~p~n~p", [Reason, SVCARD]),
                     {error, ?ERR_SERVICE_UNAVAILABLE};
-                VCARD ->
+                {ok, VCARD} ->
                     {ok, [VCARD]}
             end;
-        {selected, [<<"vcard">>],[]} ->
+        {selected, []} ->
             {error, ?ERR_SERVICE_UNAVAILABLE}
     end.
 
 set_vcard(User, VHost, VCard, VCardSearch) ->
-    LUser = jlib:nodeprep(User),
-    Username = ejabberd_odbc:escape(User),
-    LUsername = ejabberd_odbc:escape(LUser),
-    LServer = ejabberd_odbc:escape(VHost),
-    SVCARD = ejabberd_odbc:escape(
-               xml:element_to_binary(VCard)),
+    LUser = jid:nodeprep(User),
+    Username = mongoose_rdbms:escape(User),
+    LUsername = mongoose_rdbms:escape(LUser),
+    LServer = mongoose_rdbms:escape(VHost),
+    SVCARD = mongoose_rdbms:escape( exml:to_binary(VCard)),
 
-    SFN = ejabberd_odbc:escape(VCardSearch#vcard_search.fn),
-    SLFN = ejabberd_odbc:escape(VCardSearch#vcard_search.lfn),
-    SFamily = ejabberd_odbc:escape(VCardSearch#vcard_search.family),
-    SLFamily = ejabberd_odbc:escape(VCardSearch#vcard_search.lfamily),
-    SGiven = ejabberd_odbc:escape(VCardSearch#vcard_search.given),
-    SLGiven = ejabberd_odbc:escape(VCardSearch#vcard_search.lgiven),
-    SMiddle = ejabberd_odbc:escape(VCardSearch#vcard_search.middle),
-    SLMiddle = ejabberd_odbc:escape(VCardSearch#vcard_search.lmiddle),
-    SNickname = ejabberd_odbc:escape(VCardSearch#vcard_search.nickname),
-    SLNickname = ejabberd_odbc:escape(VCardSearch#vcard_search.lnickname),
-    SBDay = ejabberd_odbc:escape(VCardSearch#vcard_search.bday),
-    SLBDay = ejabberd_odbc:escape(VCardSearch#vcard_search.lbday),
-    SCTRY = ejabberd_odbc:escape(VCardSearch#vcard_search.ctry),
-    SLCTRY = ejabberd_odbc:escape(VCardSearch#vcard_search.lctry),
-    SLocality = ejabberd_odbc:escape(VCardSearch#vcard_search.locality),
-    SLLocality = ejabberd_odbc:escape(VCardSearch#vcard_search.llocality),
-    SEMail = ejabberd_odbc:escape(VCardSearch#vcard_search.email),
-    SLEMail = ejabberd_odbc:escape(VCardSearch#vcard_search.lemail),
-    SOrgName = ejabberd_odbc:escape(VCardSearch#vcard_search.orgname),
-    SLOrgName = ejabberd_odbc:escape(VCardSearch#vcard_search.lorgname),
-    SOrgUnit = ejabberd_odbc:escape(VCardSearch#vcard_search.orgunit),
-    SLOrgUnit = ejabberd_odbc:escape(VCardSearch#vcard_search.lorgunit),
+    SFN = mongoose_rdbms:escape(VCardSearch#vcard_search.fn),
+    SLFN = mongoose_rdbms:escape(VCardSearch#vcard_search.lfn),
+    SFamily = mongoose_rdbms:escape(VCardSearch#vcard_search.family),
+    SLFamily = mongoose_rdbms:escape(VCardSearch#vcard_search.lfamily),
+    SGiven = mongoose_rdbms:escape(VCardSearch#vcard_search.given),
+    SLGiven = mongoose_rdbms:escape(VCardSearch#vcard_search.lgiven),
+    SMiddle = mongoose_rdbms:escape(VCardSearch#vcard_search.middle),
+    SLMiddle = mongoose_rdbms:escape(VCardSearch#vcard_search.lmiddle),
+    SNickname = mongoose_rdbms:escape(VCardSearch#vcard_search.nickname),
+    SLNickname = mongoose_rdbms:escape(VCardSearch#vcard_search.lnickname),
+    SBDay = mongoose_rdbms:escape(VCardSearch#vcard_search.bday),
+    SLBDay = mongoose_rdbms:escape(VCardSearch#vcard_search.lbday),
+    SCTRY = mongoose_rdbms:escape(VCardSearch#vcard_search.ctry),
+    SLCTRY = mongoose_rdbms:escape(VCardSearch#vcard_search.lctry),
+    SLocality = mongoose_rdbms:escape(VCardSearch#vcard_search.locality),
+    SLLocality = mongoose_rdbms:escape(VCardSearch#vcard_search.llocality),
+    SEMail = mongoose_rdbms:escape(VCardSearch#vcard_search.email),
+    SLEMail = mongoose_rdbms:escape(VCardSearch#vcard_search.lemail),
+    SOrgName = mongoose_rdbms:escape(VCardSearch#vcard_search.orgname),
+    SLOrgName = mongoose_rdbms:escape(VCardSearch#vcard_search.lorgname),
+    SOrgUnit = mongoose_rdbms:escape(VCardSearch#vcard_search.orgunit),
+    SLOrgUnit = mongoose_rdbms:escape(VCardSearch#vcard_search.lorgunit),
 
-    odbc_queries:set_vcard(LServer, LUsername, SBDay, SCTRY, SEMail,
+    rdbms_queries:set_vcard(LServer, LUsername, SBDay, SCTRY, SEMail,
                            SFN, SFamily, SGiven, SLBDay, SLCTRY,
                            SLEMail, SLFN, SLFamily, SLGiven,
                            SLLocality, SLMiddle, SLNickname,
@@ -107,52 +112,28 @@ set_vcard(User, VHost, VCard, VCardSearch) ->
     ejabberd_hooks:run(vcard_set, VHost, [LUser, VHost, VCard]),
     ok.
 
-search(LServer, Data, _Lang, DefaultReportedFields) ->
+search(LServer, Data) ->
     RestrictionSQL = make_restriction_sql(LServer, Data),
-    AllowReturnAll = gen_mod:get_module_opt(LServer, ?MODULE,
-					    allow_return_all, false),
-    R=if
-	(RestrictionSQL == "") and (not AllowReturnAll) ->
-	    [];
-	true ->
-	    Limit = case gen_mod:get_module_opt(LServer, ?MODULE,
-						matches, ?JUD_MATCHES) of
-			infinity ->
-			    infinity;
-			Val when is_integer(Val) and (Val > 0) ->
-			    Val;
-			Val ->
-			    ?ERROR_MSG("Illegal option value ~p. "
-				       "Default value ~p substituted.",
-				       [{matches, Val}, ?JUD_MATCHES]),
-			    ?JUD_MATCHES
-		    end,
-	    case catch odbc_queries:search_vcard(LServer, RestrictionSQL, Limit) of
-		{selected, [<<"username">>, <<"server">>, <<"fn">>, <<"family">>, <<"given">>,
-			    <<"middle">>, <<"nickname">>, <<"bday">>, <<"ctry">>, <<"locality">>,
-			    <<"email">>, <<"orgname">>, <<"orgunit">>], Rs} when is_list(Rs) ->
-		    Rs;
-		Error ->
-		    ?ERROR_MSG("~p", [Error]),
-		    []
-	    end
-    end,
-    Items = lists:map(fun(I) -> record_to_item(LServer,I) end, R),
-    [DefaultReportedFields | Items].
+    R = do_search(LServer, RestrictionSQL),
+    lists:map(fun(I) -> record_to_item(LServer, I) end, R).
+
+do_search(_LServer, "") ->
+    [];
+do_search(LServer, RestrictionSQL) ->
+    Limit = mod_vcard:get_results_limit(LServer),
+    case catch rdbms_queries:search_vcard(LServer, RestrictionSQL, Limit) of
+        {selected, Rs} when is_list(Rs) ->
+            Rs;
+        Error ->
+            ?ERROR_MSG("~p", [Error]),
+            []
+    end.
 
 search_fields(_VHost) ->
-    [{<<"User">>, <<"user">>},
-	 {<<"Full Name">>, <<"fn">>},
-	 {<<"Given Name">>, <<"first">>},
-	 {<<"Middle Name">>, <<"middle">>},
-	 {<<"Family Name">>, <<"last">>},
-	 {<<"Nickname">>, <<"nick">>},
-	 {<<"Birthday">>, <<"bday">>},
-	 {<<"Country">>, <<"ctry">>},
-     {<<"City">>, <<"locality">>},
-	 {<<"Email">>, <<"email">>},
-	 {<<"Organization Name">>, <<"orgname">>},
-	 {<<"Organization Unit">>, <<"orgunit">>}].
+    mod_vcard:default_search_fields().
+
+search_reported_fields(_VHost, Lang) ->
+    mod_vcard:get_default_reported_fields(Lang).
 
 %%--------------------------------------------------------------------
 %% internal
@@ -160,14 +141,12 @@ search_fields(_VHost) ->
 make_restriction_sql(LServer, Data) ->
     filter_fields(Data, "", LServer).
 
-filter_fields([], RestrictionSQL, _LServer) ->
-    case RestrictionSQL of
-	"" ->
-	    "";
-        <<>> ->
-            <<>>;
-	_ ->
-	    [" where ", RestrictionSQL]
+filter_fields([], RestrictionSQLIn, LServer) ->
+    case RestrictionSQLIn of
+        "" ->
+            "";
+        _ ->
+            [" where ", [RestrictionSQLIn, " and ", ["server = '", mongoose_rdbms:escape(LServer), "'"]]]
     end;
 filter_fields([{SVar, [Val]} | Ds], RestrictionSQL, LServer)
   when is_binary(Val) and (Val /= <<"">>) ->
@@ -190,7 +169,7 @@ filter_fields([{SVar, [Val]} | Ds], RestrictionSQL, LServer)
         end,
     filter_fields(Ds, NewRestrictionSQL, LServer);
 filter_fields([_ | Ds], RestrictionSQL, LServer) ->
-    filter_fields(Ds,RestrictionSQL , LServer).
+    filter_fields(Ds, RestrictionSQL, LServer).
 
 -spec make_val(RestrictionSQL, Field, Val) -> Result when
     RestrictionSQL :: iolist(),
@@ -199,39 +178,37 @@ filter_fields([_ | Ds], RestrictionSQL, LServer) ->
     Result :: iolist().
 make_val(RestrictionSQL, Field, Val) ->
     Condition =
-	case binary:last(Val) of
-	    $* ->
-		Val1 = binary:part(Val, 0, byte_size(Val)-1),
-		SVal = ejabberd_odbc:escape_like(Val1),
-		[Field, " LIKE '", SVal, "%'"];
-	    _ ->
-		SVal = ejabberd_odbc:escape(Val),
-		[Field, " = '", SVal, "'"]
-	end,
+        case binary:last(Val) of
+            $* ->
+                Val1 = binary:part(Val, 0, byte_size(Val)-1),
+                SVal = mongoose_rdbms:escape_like(Val1),
+                [Field, " LIKE '", SVal, "%'"];
+            _ ->
+                SVal = mongoose_rdbms:escape(Val),
+                [Field, " = '", SVal, "'"]
+        end,
     case RestrictionSQL of
-	"" ->
-	    Condition;
-	_ ->
-	    [RestrictionSQL, " and ", Condition]
+        "" ->
+            Condition;
+        _ ->
+            [RestrictionSQL, " and ", Condition]
     end.
 
 record_to_item(_CallerVHost, {Username, VCardVHost, FN, Family, Given, Middle,
              Nickname, BDay, CTRY, Locality,
              EMail, OrgName, OrgUnit}) ->
-    #xmlel{name = "item",
+    #xmlel{name = <<"item">>,
            children = [
-                        ?FIELD("jid", [Username, "@", VCardVHost]),
-                        ?FIELD("fn", FN),
-                        ?FIELD("last", Family),
-                        ?FIELD("first", Given),
-                        ?FIELD("middle", Middle),
-                        ?FIELD("nick", Nickname),
-                        ?FIELD("bday", BDay),
-                        ?FIELD("ctry", CTRY),
-                        ?FIELD("locality", Locality),
-                        ?FIELD("email", EMail),
-                        ?FIELD("orgname", OrgName),
-                        ?FIELD("orgunit", OrgUnit)
+                        ?FIELD(<<"jid">>, <<Username/binary, "@", VCardVHost/binary>>),
+                        ?FIELD(<<"fn">>, FN),
+                        ?FIELD(<<"last">>, Family),
+                        ?FIELD(<<"first">>, Given),
+                        ?FIELD(<<"middle">>, Middle),
+                        ?FIELD(<<"nick">>, Nickname),
+                        ?FIELD(<<"bday">>, BDay),
+                        ?FIELD(<<"ctry">>, CTRY),
+                        ?FIELD(<<"locality">>, Locality),
+                        ?FIELD(<<"email">>, EMail),
+                        ?FIELD(<<"orgname">>, OrgName),
+                        ?FIELD(<<"orgunit">>, OrgUnit)
                        ]}.
-
-

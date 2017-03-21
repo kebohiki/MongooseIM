@@ -27,11 +27,11 @@
 -module(cyrsasl_plain).
 -author('alexey@process-one.net').
 
--export([start/1, stop/0, mech_new/4, mech_step/2, parse/1]).
-
+-export([start/1, stop/0, mech_new/2, mech_step/2, parse/1]).
+-xep([{xep, 78}, {version, "2.5"}]).
 -behaviour(cyrsasl).
 
--record(state, {check_password}).
+-include("ejabberd.hrl").
 
 start(_Opts) ->
     cyrsasl:register_mechanism(<<"PLAIN">>, ?MODULE, plain),
@@ -41,42 +41,43 @@ stop() ->
     ok.
 
 -spec mech_new(Host :: ejabberd:server(),
-               GetPassword :: cyrsasl:get_password_fun(),
-               CheckPassword :: cyrsasl:check_password_fun(),
-               CheckPasswordDigest :: cyrsasl:check_pass_digest_fun()
-               ) -> {ok, tuple()}.
-mech_new(_Host, _GetPassword, CheckPassword, _CheckPasswordDigest) ->
-    {ok, #state{check_password = CheckPassword}}.
+               Creds :: mongoose_credentials:t()) -> {ok, tuple()}.
+mech_new(_Host, Creds) ->
+    {ok, Creds}.
 
--spec mech_step(State :: tuple(),
-                ClientIn :: binary()
-                ) -> {ok, proplists:proplist()} | {error, binary()}.
-mech_step(State, ClientIn) ->
+-spec mech_step(Creds :: mongoose_credentials:t(),
+                ClientIn :: binary()) -> {ok, mongoose_credentials:t()}
+                                       | {error, binary()}.
+mech_step(Creds, ClientIn) ->
     case prepare(ClientIn) of
-	[AuthzId, User, Password] ->
-	    case (State#state.check_password)(User,
-                                          Password
-                                         ) of
-                {true, AuthModule} ->
-                    {ok, [{username, User}, {authzid, AuthzId},
-                          {auth_module, AuthModule}]};
-                _ ->
-                    {error, <<"not-authorized">>, User}
+        [AuthzId, User, Password] ->
+            Request = mongoose_credentials:extend(Creds,
+                                                  [{username, User},
+                                                   {password, Password},
+                                                   {authzid, AuthzId}]),
+            case ejabberd_auth:authorize(Request) of
+                {ok, Result} ->
+                    {ok, Result};
+                {error, not_authorized} ->
+                    {error, <<"not-authorized">>, User};
+                {error, R} ->
+                    ?DEBUG("authorize error: ~p", [R]),
+                    {error, <<"internal-error">>}
             end;
         _ ->
             {error, <<"bad-protocol">>}
     end.
 
--spec prepare(binary()) -> 'error' | [binary(),...].
+-spec prepare(binary()) -> 'error' | [binary(), ...].
 prepare(ClientIn) ->
     case parse(ClientIn) of
-	[<<>>, UserMaybeDomain, Password] ->
-	    case parse_domain(UserMaybeDomain) of
-		%% <NUL>login@domain<NUL>pwd
-		[User, _Domain] ->
-		    [UserMaybeDomain,
-             User,
-             Password];
+        [<<>>, UserMaybeDomain, Password] ->
+            case parse_domain(UserMaybeDomain) of
+                %% <NUL>login@domain<NUL>pwd
+                [User, _Domain] ->
+                    [UserMaybeDomain,
+                     User,
+                     Password];
                 %% <NUL>login<NUL>pwd
                 [User] ->
                     [<<>>, User, Password]
@@ -89,11 +90,11 @@ prepare(ClientIn) ->
     end.
 
 
--spec parse(binary()) -> [binary(),...].
+-spec parse(binary()) -> [binary(), ...].
 parse(S) ->
     parse1(S, <<>>, []).
 
--spec parse1(binary(),binary(),[binary()]) -> [binary(),...].
+-spec parse1(binary(), binary(), [binary()]) -> [binary(), ...].
 parse1(<<0, Cs/binary>>, S, T) ->
     parse1(Cs, <<>>, [binary_reverse(S)| T]);
 parse1(<<C, Cs/binary>>, S, T) ->
@@ -104,11 +105,11 @@ parse1(<<>>, S, T) ->
     lists:reverse([binary_reverse(S)| T]).
 
 
--spec parse_domain(binary()) -> [binary(),...].
+-spec parse_domain(binary()) -> [binary(), ...].
 parse_domain(S) ->
     parse_domain1(S, <<>>, []).
 
--spec parse_domain1(binary(),binary(),[binary()]) -> [binary(),...].
+-spec parse_domain1(binary(), binary(), [binary()]) -> [binary(), ...].
 parse_domain1(<<$@, Cs/binary>>, S, T) ->
     parse_domain1(Cs, <<>>, [binary_reverse(S) | T]);
 parse_domain1(<<C, Cs/binary>>, S, T) ->
@@ -120,5 +121,5 @@ parse_domain1(<<>>, S, T) ->
 -spec binary_reverse(binary()) -> binary().
 binary_reverse(<<>>) ->
     <<>>;
-binary_reverse(<<H,T/binary>>) ->
-    <<(binary_reverse(T))/binary,H>>.
+binary_reverse(<<H, T/binary>>) ->
+    <<(binary_reverse(T))/binary, H>>.
