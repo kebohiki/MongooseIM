@@ -69,6 +69,7 @@ start(normal, _Args) ->
     start_modules(),
     mongoose_metrics:init(),
     ejabberd_listener:start_listeners(),
+    application:start(gen_socket),
     ejabberd_admin:start(),
     ?INFO_MSG("ejabberd ~s is started in the node ~p", [?VERSION, node()]),
     Sup;

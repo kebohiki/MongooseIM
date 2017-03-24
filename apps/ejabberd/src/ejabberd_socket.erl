@@ -137,19 +137,19 @@ connect(Addr, Port, Opts) ->
               Timeout :: non_neg_integer() | infinity
               ) -> {'error', atom()} | {'ok', socket_state()}.
 connect(Addr, Port, Opts, Timeout) ->
-    case gen_tcp:connect(Addr, Port, Opts, Timeout) of
+    case gen_socket:connect(Addr, Port, Opts, Timeout) of
         {ok, Socket} ->
-            Receiver = ejabberd_receiver:start(Socket, gen_tcp, none),
-            SocketData = #socket_state{sockmod = gen_tcp,
+            Receiver = ejabberd_receiver:start(Socket, gen_socket, none),
+            SocketData = #socket_state{sockmod = gen_socket,
                                        socket = Socket,
                                        receiver = Receiver},
             Pid = self(),
-            case gen_tcp:controlling_process(Socket, Receiver) of
+            case gen_socket:controlling_process(Socket, Receiver) of
                 ok ->
                     ejabberd_receiver:become_controller(Receiver, Pid),
                     {ok, SocketData};
                 {error, _Reason} = Error ->
-                    gen_tcp:close(Socket),
+                    gen_socket:close(Socket),
                     Error
             end;
         {error, _Reason} = Error ->
@@ -193,7 +193,7 @@ compress(SocketData, InflateSizeLimit, Data) ->
     send(SocketData, Data),
     SocketData#socket_state{socket = ZlibSocket, sockmod = ejabberd_zlib}.
 
-%% @doc sockmod=gen_tcp|fast_tls|ejabberd_zlib (ejabberd:sockmod())
+%% @doc sockmod=gen_tcp|gen_socket|fast_tls|ejabberd_zlib (ejabberd:sockmod())
 send(SocketData, Data) ->
     case catch (SocketData#socket_state.sockmod):send(
              SocketData#socket_state.socket, Data) of

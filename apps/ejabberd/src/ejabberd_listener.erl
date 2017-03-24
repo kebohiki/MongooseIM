@@ -189,7 +189,7 @@ listen_tcp(PortIPProto, Module, SockOpts, Port, IPS) ->
 %% Process exit and socket release are not transactional
 %% So, there can be a short period of time when we can't bind
 listen_or_retry(Port, SockOpts, Retries) ->
-    case gen_tcp:listen(Port, SockOpts) of
+    case gen_socket:listen(Port, SockOpts) of
         {ok, ListenSocket} ->
             {ok, ListenSocket};
         {error, eaddrinuse} when Retries > 0 ->
@@ -315,7 +315,7 @@ get_ip_tuple(IPOpt, _IPVOpt) ->
              Module :: atom(),
              Opts :: [any(), ...]) -> no_return().
 accept(ListenSocket, Module, Opts) ->
-    case gen_tcp:accept(ListenSocket) of
+    case gen_socket:accept(ListenSocket) of
         {ok, Socket} ->
             case {inet:sockname(Socket), inet:peername(Socket)} of
                 {{ok, Addr}, {ok, PAddr}} ->
@@ -324,7 +324,7 @@ accept(ListenSocket, Module, Opts) ->
                 _ ->
                     ok
             end,
-            ejabberd_socket:start(Module, gen_tcp, Socket, Opts),
+            ejabberd_socket:start(Module, gen_socket, Socket, Opts),
             ?MODULE:accept(ListenSocket, Module, Opts);
         {error, Reason} ->
             ?INFO_MSG("(~w) Failed TCP accept: ~w",
